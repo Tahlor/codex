@@ -12,6 +12,8 @@ pub(crate) mod exec_events;
 
 pub use cli::Cli;
 pub use cli::Command;
+pub use cli::GoalCliOptions;
+pub use cli::GoalMode;
 pub use cli::ReviewArgs;
 use codex_app_server_client::DEFAULT_IN_PROCESS_CHANNEL_CAPACITY;
 use codex_app_server_client::EnvironmentManager;
@@ -34,6 +36,10 @@ use codex_app_server_protocol::ReviewTarget as ApiReviewTarget;
 use codex_app_server_protocol::ServerNotification;
 use codex_app_server_protocol::ServerRequest;
 use codex_app_server_protocol::Thread as AppServerThread;
+use codex_app_server_protocol::ThreadGoalGetParams;
+use codex_app_server_protocol::ThreadGoalGetResponse;
+use codex_app_server_protocol::ThreadGoalSetParams;
+use codex_app_server_protocol::ThreadGoalStatus;
 use codex_app_server_protocol::ThreadItem as AppServerThreadItem;
 use codex_app_server_protocol::ThreadListParams;
 use codex_app_server_protocol::ThreadListResponse;
@@ -85,6 +91,7 @@ use codex_protocol::models::ActivePermissionProfile;
 use codex_protocol::models::ActivePermissionProfileModification;
 use codex_protocol::models::PermissionProfile;
 use codex_protocol::protocol::AskForApproval;
+use codex_protocol::protocol::EventMsg;
 use codex_protocol::protocol::ReviewRequest;
 use codex_protocol::protocol::ReviewTarget;
 use codex_protocol::protocol::RolloutItem;
@@ -94,6 +101,7 @@ use codex_protocol::protocol::SessionSource;
 use codex_protocol::user_input::UserInput;
 use codex_utils_absolute_path::AbsolutePathBuf;
 use codex_utils_absolute_path::canonicalize_existing_preserving_symlinks;
+use codex_utils_cli::CliConfigOverrides;
 use codex_utils_cli::SharedCliOptions;
 use codex_utils_oss::ensure_oss_provider_ready;
 use codex_utils_oss::get_default_model_for_oss_provider;
@@ -153,6 +161,7 @@ use tracing_subscriber::prelude::*;
 use uuid::Uuid;
 
 use crate::cli::Command as ExecCommand;
+use crate::cli::ResolvedGoalCliOptions;
 use crate::event_processor::EventProcessor;
 
 const DEFAULT_ANALYTICS_ENABLED: bool = true;
@@ -196,6 +205,307 @@ impl RequestIdSequencer {
     }
 }
 
+#[derive(Clone, Debug, Default)]
+struct GoalHandoff {
+    status_file: Option<PathBuf>,
+    context_file: Option<PathBuf>,
+}
+
+#[derive(Clone, Debug)]
+struct FreshResumeSeed {
+    source_thread_id: String,
+    objective: String,
+}
+
+#[derive(Clone, Copy, Debug)]
+enum HistoricalGoalPick {
+    First,
+    Last,
+}
+
+#[derive(Debug, Default)]
+struct TurnRunOutcome {
+    error_seen: bool,
+    final_agent_message: Option<String>,
+}
+
+fn default_handoff_dir(config: &Config, options: &ResolvedGoalCliOptions) -> PathBuf {
+    resolve_workspace_path(
+        config.cwd.as_path(),
+        options
+            .handoff_dir
+            .clone()
+            .unwrap_or_else(|| PathBuf::from(".codex").join("sessions").join("goal")),
+    )
+}
+
+fn resolve_workspace_path(cwd: &Path, path: PathBuf) -> PathBuf {
+    if path.is_absolute() {
+        path
+    } else {
+        cwd.join(path)
+    }
+}
+
+fn ensure_file_with_default(path: &Path, contents: &str) -> anyhow::Result<()> {
+    if let Some(parent) = path.parent() {
+        std::fs::create_dir_all(parent)?;
+    }
+    if !path.exists() {
+        std::fs::write(path, contents)?;
+    }
+    Ok(())
+}
+
+fn should_create_default_status_file(options: &ResolvedGoalCliOptions) -> bool {
+    options.handoff_dir.is_some()
+        || options.auto_recover
+        || options.turns > 1
+        || matches!(options.mode, Some(GoalMode::V5 | GoalMode::V6))
+}
+
+fn should_create_default_context_file(
+    options: &ResolvedGoalCliOptions,
+    fresh_resume: Option<&FreshResumeSeed>,
+) -> bool {
+    options.handoff_dir.is_some() || fresh_resume.is_some()
+}
+
+fn prepare_goal_handoff(
+    config: &Config,
+    options: &ResolvedGoalCliOptions,
+    fresh_resume: Option<&FreshResumeSeed>,
+) -> anyhow::Result<GoalHandoff> {
+    let default_dir = default_handoff_dir(config, options);
+    let status_file = options
+        .status_file
+        .clone()
+        .or_else(|| {
+            should_create_default_status_file(options).then(|| default_dir.join("STATUS.md"))
+        })
+        .map(|path| resolve_workspace_path(config.cwd.as_path(), path));
+    let context_file = options
+        .context_file
+        .clone()
+        .or_else(|| {
+            should_create_default_context_file(options, fresh_resume)
+                .then(|| default_dir.join("RECOVERY_CONTEXT.md"))
+        })
+        .map(|path| resolve_workspace_path(config.cwd.as_path(), path));
+
+    if let Some(path) = status_file.as_deref() {
+        ensure_file_with_default(path, "# Codex Status\n\n")?;
+    }
+    if let Some(path) = context_file.as_deref() {
+        let contents = if let Some(seed) = fresh_resume {
+            format!(
+                "# Codex Recovery Context\n\nSource thread: {}\n\nRecovered goal:\n{}\n",
+                seed.source_thread_id, seed.objective
+            )
+        } else {
+            "# Codex Recovery Context\n\n".to_string()
+        };
+        ensure_file_with_default(path, &contents)?;
+    }
+
+    Ok(GoalHandoff {
+        status_file,
+        context_file,
+    })
+}
+
+fn prompt_with_handoff(prompt: &str, handoff: &GoalHandoff) -> String {
+    let mut additions = Vec::new();
+    if let Some(path) = handoff.context_file.as_deref() {
+        additions.push(format!(
+            "Read the bounded recovery context at `{}` before continuing.",
+            path.display()
+        ));
+    }
+    if let Some(path) = handoff.status_file.as_deref() {
+        additions.push(format!(
+            "Read or create the durable status file at `{}` and keep it current.",
+            path.display()
+        ));
+    }
+    if additions.is_empty() {
+        prompt.to_string()
+    } else {
+        format!("{}\n\n{}", prompt, additions.join("\n"))
+    }
+}
+
+async fn recover_fresh_resume_seed(
+    client: &InProcessAppServerClient,
+    request_ids: &mut RequestIdSequencer,
+    config: &Config,
+    state_db: Option<&StateDbHandle>,
+    args: &crate::cli::ResumeArgs,
+    options: &ResolvedGoalCliOptions,
+) -> anyhow::Result<FreshResumeSeed> {
+    let source_thread_id = resolve_resume_thread_id(client, config, state_db, args)
+        .await?
+        .ok_or_else(|| anyhow::anyhow!("--fresh-resume could not resolve a source thread"))?;
+    let thread_id = ThreadId::from_string(&source_thread_id)
+        .map_err(|err| anyhow::anyhow!("--fresh-resume session id must be a thread UUID: {err}"))?;
+    let objective = recover_goal_objective_for_fresh_resume(
+        client,
+        request_ids,
+        config,
+        state_db,
+        thread_id,
+        &source_thread_id,
+        options,
+    )
+    .await?;
+    Ok(FreshResumeSeed {
+        source_thread_id,
+        objective,
+    })
+}
+
+async fn recover_goal_objective_for_fresh_resume(
+    client: &InProcessAppServerClient,
+    request_ids: &mut RequestIdSequencer,
+    config: &Config,
+    state_db: Option<&StateDbHandle>,
+    thread_id: ThreadId,
+    source_thread_id: &str,
+    options: &ResolvedGoalCliOptions,
+) -> anyhow::Result<String> {
+    if options.first_goal || options.last_goal {
+        let pick = if options.first_goal {
+            HistoricalGoalPick::First
+        } else {
+            HistoricalGoalPick::Last
+        };
+        if let Some(objective) =
+            recover_historical_goal_objective(config, state_db, thread_id, pick).await?
+        {
+            return Ok(objective);
+        }
+        if options.last_goal
+            && let Some(objective) =
+                recover_current_goal_objective(client, request_ids, source_thread_id).await?
+        {
+            return Ok(objective);
+        }
+        anyhow::bail!("no stored goal found for thread {source_thread_id}");
+    }
+
+    if let Some(objective) =
+        recover_current_goal_objective(client, request_ids, source_thread_id).await?
+    {
+        return Ok(objective);
+    }
+    if let Some(objective) =
+        recover_historical_goal_objective(config, state_db, thread_id, HistoricalGoalPick::Last)
+            .await?
+    {
+        return Ok(objective);
+    }
+
+    anyhow::bail!("no stored goal found for thread {source_thread_id}")
+}
+
+async fn recover_current_goal_objective(
+    client: &InProcessAppServerClient,
+    request_ids: &mut RequestIdSequencer,
+    thread_id: &str,
+) -> anyhow::Result<Option<String>> {
+    let response: ThreadGoalGetResponse = send_request_with_response(
+        client,
+        ClientRequest::ThreadGoalGet {
+            request_id: request_ids.next(),
+            params: ThreadGoalGetParams {
+                thread_id: thread_id.to_string(),
+            },
+        },
+        "thread/goal/get",
+    )
+    .await
+    .map_err(anyhow::Error::msg)?;
+    Ok(response.goal.map(|goal| goal.objective))
+}
+
+async fn recover_historical_goal_objective(
+    config: &Config,
+    state_db: Option<&StateDbHandle>,
+    thread_id: ThreadId,
+    pick: HistoricalGoalPick,
+) -> anyhow::Result<Option<String>> {
+    let path = codex_core::find_thread_path_by_id_str(
+        &config.codex_home,
+        &thread_id.to_string(),
+        state_db.map(|handle| handle.as_ref()),
+    )
+    .await?;
+    let Some(path) = path else {
+        return Ok(None);
+    };
+    goal_objective_from_rollout_path(path.as_path(), pick).await
+}
+
+async fn goal_objective_from_rollout_path(
+    path: &Path,
+    pick: HistoricalGoalPick,
+) -> anyhow::Result<Option<String>> {
+    let text = match tokio::fs::read_to_string(path).await {
+        Ok(text) => text,
+        Err(err) if err.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+        Err(err) => return Err(err.into()),
+    };
+    let mut selected = None;
+    for line in text.lines() {
+        let trimmed = line.trim();
+        if trimmed.is_empty() {
+            continue;
+        }
+        let Ok(rollout_line) = serde_json::from_str::<RolloutLine>(trimmed) else {
+            continue;
+        };
+        let RolloutItem::EventMsg(EventMsg::ThreadGoalUpdated(event)) = rollout_line.item else {
+            continue;
+        };
+        if event.goal.objective.trim().is_empty() {
+            continue;
+        }
+        match pick {
+            HistoricalGoalPick::First => return Ok(Some(event.goal.objective)),
+            HistoricalGoalPick::Last => selected = Some(event.goal.objective),
+        }
+    }
+    Ok(selected)
+}
+
+fn follow_up_prompt(
+    original_prompt: &str,
+    options: &ResolvedGoalCliOptions,
+    handoff: &GoalHandoff,
+) -> String {
+    let base = if options.repeat {
+        original_prompt.to_string()
+    } else if options.carry {
+        match options.next.as_deref() {
+            Some(next) => format!("{original_prompt}\n\n{next}"),
+            None => original_prompt.to_string(),
+        }
+    } else {
+        options.next.clone().unwrap_or_else(|| {
+            "Continue the active goal and ship the next useful improvement.".to_string()
+        })
+    };
+    prompt_with_handoff(&base, handoff)
+}
+
+fn should_stop_after_turn(outcome: &TurnRunOutcome, options: &ResolvedGoalCliOptions) -> bool {
+    options.early_stopping
+        && outcome
+            .final_agent_message
+            .as_deref()
+            .is_some_and(|message| message.contains(&options.stop_token))
+}
+
 struct ExecRunArgs {
     in_process_start_args: InProcessClientStartArgs,
     state_db: Option<StateDbHandle>,
@@ -206,6 +516,7 @@ struct ExecRunArgs {
     images: Vec<PathBuf>,
     json_mode: bool,
     last_message_file: Option<PathBuf>,
+    goal_options: ResolvedGoalCliOptions,
     model_provider: Option<String>,
     oss: bool,
     output_schema_path: Option<PathBuf>,
@@ -243,6 +554,7 @@ pub async fn run_main(cli: Cli, arg0_paths: Arg0DispatchPaths) -> anyhow::Result
 
     let Cli {
         command,
+        goal,
         shared,
         skip_git_repo_check,
         ephemeral,
@@ -256,6 +568,14 @@ pub async fn run_main(cli: Cli, arg0_paths: Arg0DispatchPaths) -> anyhow::Result
         output_schema: output_schema_path,
         config_overrides,
     } = cli;
+    let goal_options = match goal.resolve() {
+        Ok(options) => options,
+        #[allow(clippy::print_stderr)]
+        Err(err) => {
+            eprintln!("Error parsing goal options: {err}");
+            std::process::exit(1);
+        }
+    };
     let shared = shared.into_inner();
     let SharedCliOptions {
         images,
@@ -291,7 +611,7 @@ pub async fn run_main(cli: Cli, arg0_paths: Arg0DispatchPaths) -> anyhow::Result
     };
 
     // Parse `-c` overrides from the CLI.
-    let cli_kv_overrides = match config_overrides.parse_overrides() {
+    let mut cli_kv_overrides = match config_overrides.parse_overrides() {
         Ok(v) => v,
         #[allow(clippy::print_stderr)]
         Err(e) => {
@@ -299,6 +619,15 @@ pub async fn run_main(cli: Cli, arg0_paths: Arg0DispatchPaths) -> anyhow::Result
             std::process::exit(1);
         }
     };
+    if goal_options.goal {
+        cli_kv_overrides.extend(
+            CliConfigOverrides {
+                raw_overrides: vec!["features.goals=true".to_string()],
+            }
+            .parse_overrides()
+            .expect("hard-coded goal feature override parses"),
+        );
+    }
 
     let resolved_cwd = cwd.clone();
     let config_cwd = match resolved_cwd.as_deref() {
@@ -540,6 +869,7 @@ pub async fn run_main(cli: Cli, arg0_paths: Arg0DispatchPaths) -> anyhow::Result
         images,
         json_mode,
         last_message_file,
+        goal_options,
         model_provider,
         oss,
         output_schema_path,
@@ -562,6 +892,7 @@ async fn run_exec_session(args: ExecRunArgs) -> anyhow::Result<()> {
         images,
         json_mode,
         last_message_file,
+        goal_options,
         model_provider,
         oss,
         output_schema_path,
@@ -596,68 +927,6 @@ async fn run_exec_session(args: ExecRunArgs) -> anyhow::Result<()> {
     }
 
     let default_cwd = config.cwd.to_path_buf();
-    let default_approval_policy = config.permissions.approval_policy.value();
-    let default_effort = config.model_reasoning_effort;
-
-    let (initial_operation, prompt_summary) = match (command.as_ref(), prompt, images) {
-        (Some(ExecCommand::Review(review_cli)), _, _) => {
-            let review_request = build_review_request(review_cli)?;
-            let summary = codex_core::review_prompts::user_facing_hint(&review_request.target);
-            (InitialOperation::Review { review_request }, summary)
-        }
-        (Some(ExecCommand::Resume(args)), root_prompt, imgs) => {
-            let prompt_arg = args
-                .prompt
-                .clone()
-                .or_else(|| {
-                    if args.last {
-                        args.session_id.clone()
-                    } else {
-                        None
-                    }
-                })
-                .or(root_prompt);
-            let prompt_text = resolve_prompt(prompt_arg);
-            let mut items: Vec<UserInput> = imgs
-                .into_iter()
-                .chain(args.images.iter().cloned())
-                .map(|path| UserInput::LocalImage { path })
-                .collect();
-            items.push(UserInput::Text {
-                text: prompt_text.clone(),
-                // CLI input doesn't track UI element ranges, so none are available here.
-                text_elements: Vec::new(),
-            });
-            let output_schema = load_output_schema(output_schema_path.clone());
-            (
-                InitialOperation::UserTurn {
-                    items,
-                    output_schema,
-                },
-                prompt_text,
-            )
-        }
-        (None, root_prompt, imgs) => {
-            let prompt_text = resolve_root_prompt(root_prompt);
-            let mut items: Vec<UserInput> = imgs
-                .into_iter()
-                .map(|path| UserInput::LocalImage { path })
-                .collect();
-            items.push(UserInput::Text {
-                text: prompt_text.clone(),
-                // CLI input doesn't track UI element ranges, so none are available here.
-                text_elements: Vec::new(),
-            });
-            let output_schema = load_output_schema(output_schema_path);
-            (
-                InitialOperation::UserTurn {
-                    items,
-                    output_schema,
-                },
-                prompt_text,
-            )
-        }
-    };
 
     // When --yolo (dangerously_bypass_approvals_and_sandbox) is set, also skip the git repo check
     // since the user is explicitly running in an externally sandboxed environment.
@@ -676,16 +945,141 @@ async fn run_exec_session(args: ExecRunArgs) -> anyhow::Result<()> {
             anyhow::anyhow!("failed to initialize in-process app-server client: {err}")
         })?;
 
+    let fresh_resume_seed = match command.as_ref() {
+        Some(ExecCommand::Resume(args)) if goal_options.fresh_resume => Some(
+            recover_fresh_resume_seed(
+                &mut client,
+                &mut request_ids,
+                &config,
+                state_db.as_ref(),
+                args,
+                &goal_options,
+            )
+            .await?,
+        ),
+        _ => None,
+    };
+    let goal_handoff = prepare_goal_handoff(&config, &goal_options, fresh_resume_seed.as_ref())?;
+
+    let (initial_operation, prompt_summary, followup_source_prompt, initial_goal_objective) =
+        match (command.as_ref(), prompt, images) {
+            (Some(ExecCommand::Review(review_cli)), _, _) => {
+                let review_request = build_review_request(review_cli)?;
+                let summary = codex_core::review_prompts::user_facing_hint(&review_request.target);
+                (
+                    InitialOperation::Review { review_request },
+                    summary,
+                    None,
+                    None,
+                )
+            }
+            (Some(ExecCommand::Resume(args)), root_prompt, imgs) if fresh_resume_seed.is_some() => {
+                let seed = fresh_resume_seed
+                    .as_ref()
+                    .expect("fresh resume seed checked above");
+                let extra_prompt = args
+                    .prompt
+                    .clone()
+                    .or(root_prompt)
+                    .map(|prompt| resolve_prompt(Some(prompt)));
+                let base_prompt = match extra_prompt {
+                    Some(extra) if !extra.trim().is_empty() => {
+                        format!("{}\n\n{}", seed.objective, extra)
+                    }
+                    _ => seed.objective.clone(),
+                };
+                let prompt_text = prompt_with_handoff(&base_prompt, &goal_handoff);
+                let mut items: Vec<UserInput> = imgs
+                    .into_iter()
+                    .chain(args.images.iter().cloned())
+                    .map(|path| UserInput::LocalImage { path })
+                    .collect();
+                items.push(UserInput::Text {
+                    text: prompt_text.clone(),
+                    // CLI input doesn't track UI element ranges, so none are available here.
+                    text_elements: Vec::new(),
+                });
+                let output_schema = load_output_schema(output_schema_path.clone());
+                (
+                    InitialOperation::UserTurn {
+                        items,
+                        output_schema,
+                    },
+                    prompt_text,
+                    Some(base_prompt.clone()),
+                    Some(base_prompt),
+                )
+            }
+            (Some(ExecCommand::Resume(args)), root_prompt, imgs) => {
+                let prompt_arg = args
+                    .prompt
+                    .clone()
+                    .or_else(|| {
+                        if args.last {
+                            args.session_id.clone()
+                        } else {
+                            None
+                        }
+                    })
+                    .or(root_prompt);
+                let base_prompt = resolve_prompt(prompt_arg);
+                let prompt_text = prompt_with_handoff(&base_prompt, &goal_handoff);
+                let mut items: Vec<UserInput> = imgs
+                    .into_iter()
+                    .chain(args.images.iter().cloned())
+                    .map(|path| UserInput::LocalImage { path })
+                    .collect();
+                items.push(UserInput::Text {
+                    text: prompt_text.clone(),
+                    // CLI input doesn't track UI element ranges, so none are available here.
+                    text_elements: Vec::new(),
+                });
+                let output_schema = load_output_schema(output_schema_path.clone());
+                (
+                    InitialOperation::UserTurn {
+                        items,
+                        output_schema,
+                    },
+                    prompt_text,
+                    Some(base_prompt.clone()),
+                    Some(base_prompt),
+                )
+            }
+            (None, root_prompt, imgs) => {
+                let base_prompt = resolve_root_prompt(root_prompt);
+                let prompt_text = prompt_with_handoff(&base_prompt, &goal_handoff);
+                let mut items: Vec<UserInput> = imgs
+                    .into_iter()
+                    .map(|path| UserInput::LocalImage { path })
+                    .collect();
+                items.push(UserInput::Text {
+                    text: prompt_text.clone(),
+                    // CLI input doesn't track UI element ranges, so none are available here.
+                    text_elements: Vec::new(),
+                });
+                let output_schema = load_output_schema(output_schema_path);
+                (
+                    InitialOperation::UserTurn {
+                        items,
+                        output_schema,
+                    },
+                    prompt_text,
+                    Some(base_prompt.clone()),
+                    Some(base_prompt),
+                )
+            }
+        };
+
     // Handle resume subcommand through existing `thread/list` + `thread/resume`
     // APIs so exec no longer reaches into rollout storage directly.
     let (primary_thread_id, fallback_session_configured) = if let Some(ExecCommand::Resume(args)) =
-        command.as_ref()
+        command.as_ref().filter(|_| !goal_options.fresh_resume)
     {
         if let Some(thread_id) =
             resolve_resume_thread_id(&client, &config, state_db.as_ref(), args).await?
         {
             let response: ThreadResumeResponse = send_request_with_response(
-                &client,
+                &mut client,
                 ClientRequest::ThreadResume {
                     request_id: request_ids.next(),
                     params: thread_resume_params_from_config(&config, thread_id),
@@ -700,7 +1094,7 @@ async fn run_exec_session(args: ExecRunArgs) -> anyhow::Result<()> {
             (session_configured.thread_id, session_configured)
         } else {
             let response: ThreadStartResponse = send_request_with_response(
-                &client,
+                &mut client,
                 ClientRequest::ThreadStart {
                     request_id: request_ids.next(),
                     params: thread_start_params_from_config(&config),
@@ -758,45 +1152,34 @@ async fn run_exec_session(args: ExecRunArgs) -> anyhow::Result<()> {
         }
     });
 
-    let task_id = match initial_operation {
+    let mut interrupt_channel_open = true;
+    let mut primary_thread_id_for_requests = primary_thread_id.to_string();
+    let mut outcome = match initial_operation {
         InitialOperation::UserTurn {
             items,
             output_schema,
         } => {
-            let response: TurnStartResponse = send_request_with_response(
-                &client,
-                ClientRequest::TurnStart {
-                    request_id: request_ids.next(),
-                    params: TurnStartParams {
-                        thread_id: primary_thread_id_for_span.clone(),
-                        input: items.into_iter().map(Into::into).collect(),
-                        responsesapi_client_metadata: None,
-                        environments: None,
-                        cwd: Some(default_cwd),
-                        approval_policy: Some(default_approval_policy.into()),
-                        approvals_reviewer: None,
-                        sandbox_policy: None,
-                        permissions: None,
-                        model: None,
-                        service_tier: None,
-                        effort: default_effort,
-                        summary: None,
-                        personality: None,
-                        output_schema,
-                        collaboration_mode: None,
-                    },
-                },
-                "turn/start",
+            start_user_turn_with_recovery(
+                &mut client,
+                &mut request_ids,
+                event_processor.as_mut(),
+                &config,
+                &exec_span,
+                &mut interrupt_rx,
+                &mut interrupt_channel_open,
+                &mut primary_thread_id_for_requests,
+                items,
+                output_schema,
+                initial_goal_objective
+                    .as_deref()
+                    .unwrap_or(prompt_summary.as_str()),
+                &goal_options,
             )
-            .await
-            .map_err(anyhow::Error::msg)?;
-            let task_id = response.turn.id;
-            info!("Sent prompt with event ID: {task_id}");
-            task_id
+            .await?
         }
         InitialOperation::Review { review_request } => {
             let response: ReviewStartResponse = send_request_with_response(
-                &client,
+                &mut client,
                 ClientRequest::ReviewStart {
                     request_id: request_ids.next(),
                     params: ReviewStartParams {
@@ -817,31 +1200,239 @@ async fn run_exec_session(args: ExecRunArgs) -> anyhow::Result<()> {
             ));
             let task_id = response.turn.id;
             info!("Sent review request with event ID: {task_id}");
-            task_id
+            exec_span.record("turn.id", task_id.as_str());
+            run_task_until_complete(
+                &mut client,
+                &mut request_ids,
+                event_processor.as_mut(),
+                config.ephemeral,
+                &mut interrupt_rx,
+                &mut interrupt_channel_open,
+                &primary_thread_id_for_requests,
+                &task_id,
+            )
+            .await
         }
     };
-    exec_span.record("turn.id", task_id.as_str());
 
-    // Run the loop until the task is complete.
-    // Track whether a fatal error was reported by the server so we can
-    // exit with a non-zero status for automation-friendly signaling.
-    let mut error_seen = false;
-    let mut interrupt_channel_open = true;
-    let primary_thread_id_for_requests = primary_thread_id.to_string();
+    if !outcome.error_seen
+        && let Some(original_prompt) = followup_source_prompt.as_deref()
+    {
+        for _turn_number in 2..=goal_options.turns {
+            if should_stop_after_turn(&outcome, &goal_options) {
+                break;
+            }
+            let prompt_text = follow_up_prompt(original_prompt, &goal_options, &goal_handoff);
+            outcome = start_user_turn_with_recovery(
+                &mut client,
+                &mut request_ids,
+                event_processor.as_mut(),
+                &config,
+                &exec_span,
+                &mut interrupt_rx,
+                &mut interrupt_channel_open,
+                &mut primary_thread_id_for_requests,
+                vec![UserInput::Text {
+                    text: prompt_text.clone(),
+                    text_elements: Vec::new(),
+                }],
+                None,
+                &prompt_text,
+                &goal_options,
+            )
+            .await?;
+            if outcome.error_seen {
+                break;
+            }
+        }
+    }
+
+    if let Err(err) = client.shutdown().await {
+        warn!("in-process app-server shutdown failed: {err}");
+    }
+    event_processor.print_final_output();
+    if outcome.error_seen {
+        std::process::exit(1);
+    }
+
+    Ok(())
+}
+
+#[expect(
+    clippy::too_many_arguments,
+    reason = "exec recovery must coordinate app-server, display, interrupts, and turn state"
+)]
+async fn start_user_turn_with_recovery(
+    client: &mut InProcessAppServerClient,
+    request_ids: &mut RequestIdSequencer,
+    event_processor: &mut dyn EventProcessor,
+    config: &Config,
+    exec_span: &tracing::Span,
+    interrupt_rx: &mut mpsc::UnboundedReceiver<()>,
+    interrupt_channel_open: &mut bool,
+    thread_id: &mut String,
+    items: Vec<UserInput>,
+    output_schema: Option<Value>,
+    goal_objective: &str,
+    goal_options: &ResolvedGoalCliOptions,
+) -> anyhow::Result<TurnRunOutcome> {
+    let mut attempt = 0usize;
+    loop {
+        set_thread_goal_if_enabled(client, request_ids, thread_id, goal_objective, goal_options)
+            .await?;
+        let task_id = start_user_turn(
+            client,
+            request_ids,
+            config,
+            thread_id,
+            items.clone(),
+            output_schema.clone(),
+        )
+        .await?;
+        exec_span.record("turn.id", task_id.as_str());
+        info!("Sent prompt with event ID: {task_id}");
+        let outcome = run_task_until_complete(
+            client,
+            request_ids,
+            event_processor,
+            config.ephemeral,
+            interrupt_rx,
+            interrupt_channel_open,
+            thread_id,
+            &task_id,
+        )
+        .await;
+
+        if !outcome.error_seen || !goal_options.auto_recover || attempt >= goal_options.retries {
+            return Ok(outcome);
+        }
+
+        attempt += 1;
+        let message = format!(
+            "goal turn failed; retrying in a fresh thread ({attempt}/{})",
+            goal_options.retries
+        );
+        warn!("{message}");
+        event_processor.process_warning(message);
+        let session_configured = start_new_thread(client, request_ids, config).await?;
+        *thread_id = session_configured.thread_id.to_string();
+        exec_span.record("thread.id", thread_id.as_str());
+    }
+}
+
+async fn start_new_thread(
+    client: &mut InProcessAppServerClient,
+    request_ids: &mut RequestIdSequencer,
+    config: &Config,
+) -> anyhow::Result<SessionConfiguredEvent> {
+    let response: ThreadStartResponse = send_request_with_response(
+        client,
+        ClientRequest::ThreadStart {
+            request_id: request_ids.next(),
+            params: thread_start_params_from_config(config),
+        },
+        "thread/start",
+    )
+    .await
+    .map_err(anyhow::Error::msg)?;
+    session_configured_from_thread_start_response(&response, config).map_err(anyhow::Error::msg)
+}
+
+async fn start_user_turn(
+    client: &mut InProcessAppServerClient,
+    request_ids: &mut RequestIdSequencer,
+    config: &Config,
+    thread_id: &str,
+    items: Vec<UserInput>,
+    output_schema: Option<Value>,
+) -> anyhow::Result<String> {
+    let response: TurnStartResponse = send_request_with_response(
+        client,
+        ClientRequest::TurnStart {
+            request_id: request_ids.next(),
+            params: TurnStartParams {
+                thread_id: thread_id.to_string(),
+                input: items.into_iter().map(Into::into).collect(),
+                responsesapi_client_metadata: None,
+                environments: None,
+                cwd: Some(config.cwd.to_path_buf()),
+                approval_policy: Some(config.permissions.approval_policy.value().clone().into()),
+                approvals_reviewer: None,
+                sandbox_policy: None,
+                permissions: None,
+                model: None,
+                service_tier: None,
+                effort: config.model_reasoning_effort.clone(),
+                summary: None,
+                personality: None,
+                output_schema,
+                collaboration_mode: None,
+            },
+        },
+        "turn/start",
+    )
+    .await
+    .map_err(anyhow::Error::msg)?;
+    Ok(response.turn.id)
+}
+
+async fn set_thread_goal_if_enabled(
+    client: &InProcessAppServerClient,
+    request_ids: &mut RequestIdSequencer,
+    thread_id: &str,
+    objective: &str,
+    options: &ResolvedGoalCliOptions,
+) -> anyhow::Result<()> {
+    if !options.goal {
+        return Ok(());
+    }
+    send_request_with_response::<codex_app_server_protocol::ThreadGoalSetResponse>(
+        client,
+        ClientRequest::ThreadGoalSet {
+            request_id: request_ids.next(),
+            params: ThreadGoalSetParams {
+                thread_id: thread_id.to_string(),
+                objective: Some(objective.to_string()),
+                status: Some(ThreadGoalStatus::Active),
+                token_budget: None,
+            },
+        },
+        "thread/goal/set",
+    )
+    .await
+    .map(|_| ())
+    .map_err(anyhow::Error::msg)
+}
+
+#[expect(
+    clippy::too_many_arguments,
+    reason = "turn event loop needs app-server, interrupt, and filtering state"
+)]
+async fn run_task_until_complete(
+    client: &mut InProcessAppServerClient,
+    request_ids: &mut RequestIdSequencer,
+    event_processor: &mut dyn EventProcessor,
+    thread_ephemeral: bool,
+    interrupt_rx: &mut mpsc::UnboundedReceiver<()>,
+    interrupt_channel_open: &mut bool,
+    thread_id: &str,
+    task_id: &str,
+) -> TurnRunOutcome {
+    let mut outcome = TurnRunOutcome::default();
     loop {
         let server_event = tokio::select! {
-            maybe_interrupt = interrupt_rx.recv(), if interrupt_channel_open => {
+            maybe_interrupt = interrupt_rx.recv(), if *interrupt_channel_open => {
                 if maybe_interrupt.is_none() {
-                    interrupt_channel_open = false;
+                    *interrupt_channel_open = false;
                     continue;
                 }
                 if let Err(err) = send_request_with_response::<TurnInterruptResponse>(
-                    &client,
+                    client,
                     ClientRequest::TurnInterrupt {
                         request_id: request_ids.next(),
                         params: TurnInterruptParams {
-                            thread_id: primary_thread_id_for_requests.clone(),
-                            turn_id: task_id.clone(),
+                            thread_id: thread_id.to_string(),
+                            turn_id: task_id.to_string(),
                         },
                     },
                     "turn/interrupt",
@@ -861,18 +1452,18 @@ async fn run_exec_session(args: ExecRunArgs) -> anyhow::Result<()> {
 
         match server_event {
             InProcessServerEvent::ServerRequest(request) => {
-                handle_server_request(&client, request, &mut error_seen).await;
+                handle_server_request(client, request, &mut outcome.error_seen).await;
             }
             InProcessServerEvent::ServerNotification(mut notification) => {
                 if let ServerNotification::Error(payload) = &notification {
-                    if payload.thread_id == primary_thread_id_for_requests
+                    if payload.thread_id == thread_id
                         && payload.turn_id == task_id
                         && !payload.will_retry
                     {
-                        error_seen = true;
+                        outcome.error_seen = true;
                     }
                 } else if let ServerNotification::TurnCompleted(payload) = &notification
-                    && payload.thread_id == primary_thread_id_for_requests
+                    && payload.thread_id == thread_id
                     && payload.turn.id == task_id
                     && matches!(
                         payload.turn.status,
@@ -880,31 +1471,29 @@ async fn run_exec_session(args: ExecRunArgs) -> anyhow::Result<()> {
                             | codex_app_server_protocol::TurnStatus::Interrupted
                     )
                 {
-                    error_seen = true;
+                    outcome.error_seen = true;
                 }
 
                 maybe_backfill_turn_completed_items(
-                    config.ephemeral,
-                    &client,
-                    &mut request_ids,
+                    thread_ephemeral,
+                    client,
+                    request_ids,
                     &mut notification,
                 )
                 .await;
 
-                if should_process_notification(
-                    &notification,
-                    &primary_thread_id_for_requests,
-                    &task_id,
-                ) {
+                if let ServerNotification::TurnCompleted(payload) = &notification
+                    && payload.thread_id == thread_id
+                    && payload.turn.id == task_id
+                {
+                    outcome.final_agent_message = last_agent_message_text(&payload.turn.items);
+                }
+
+                if should_process_notification(&notification, thread_id, task_id) {
                     match event_processor.process_server_notification(notification) {
                         CodexStatus::Running => {}
                         CodexStatus::InitiateShutdown => {
-                            if let Err(err) = request_shutdown(
-                                &client,
-                                &mut request_ids,
-                                &primary_thread_id_for_requests,
-                            )
-                            .await
+                            if let Err(err) = request_shutdown(client, request_ids, thread_id).await
                             {
                                 warn!("thread/unsubscribe failed during shutdown: {err}");
                             }
@@ -920,16 +1509,14 @@ async fn run_exec_session(args: ExecRunArgs) -> anyhow::Result<()> {
             }
         }
     }
+    outcome
+}
 
-    if let Err(err) = client.shutdown().await {
-        warn!("in-process app-server shutdown failed: {err}");
-    }
-    event_processor.print_final_output();
-    if error_seen {
-        std::process::exit(1);
-    }
-
-    Ok(())
+fn last_agent_message_text(items: &[AppServerThreadItem]) -> Option<String> {
+    items.iter().rev().find_map(|item| match item {
+        AppServerThreadItem::AgentMessage { text, .. } => Some(text.clone()),
+        _ => None,
+    })
 }
 
 fn thread_start_params_from_config(config: &Config) -> ThreadStartParams {

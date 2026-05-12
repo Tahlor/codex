@@ -72,6 +72,70 @@ fn parses_config_isolation_flags() {
 }
 
 #[test]
+fn parses_goal_mode_and_turn_loop_flags() {
+    let cli = Cli::parse_from([
+        "codex-exec",
+        "--mode",
+        "v5",
+        "--status-file",
+        ".codex/STATUS.md",
+        "--context-file",
+        ".codex/RECOVERY_CONTEXT.md",
+        "--turns",
+        "3",
+        "--next",
+        "Continue from status",
+        "ship it",
+    ]);
+
+    let resolved = cli.goal.resolve().expect("goal options should resolve");
+    assert_eq!(resolved.mode, Some(GoalMode::V5));
+    assert!(resolved.goal);
+    assert_eq!(resolved.turns, 3);
+    assert_eq!(resolved.next.as_deref(), Some("Continue from status"));
+    assert_eq!(
+        resolved.status_file,
+        Some(PathBuf::from(".codex/STATUS.md"))
+    );
+    assert_eq!(
+        resolved.context_file,
+        Some(PathBuf::from(".codex/RECOVERY_CONTEXT.md"))
+    );
+}
+
+#[test]
+fn v6_mode_defaults_to_fresh_resume() {
+    let cli = Cli::parse_from(["codex-exec", "--mode", "v6", "resume", "session-id"]);
+
+    let resolved = cli.goal.resolve().expect("goal options should resolve");
+    assert_eq!(resolved.mode, Some(GoalMode::V6));
+    assert!(resolved.goal);
+    assert!(resolved.fresh_resume);
+}
+
+#[test]
+fn goal_options_reject_zero_turns() {
+    let cli = Cli::parse_from(["codex-exec", "--turns", "0", "ship"]);
+
+    let err = cli
+        .goal
+        .resolve()
+        .expect_err("zero turns should be rejected");
+    assert!(err.contains("--turns must be greater than 0"));
+}
+
+#[test]
+fn goal_options_reject_empty_stop_token() {
+    let cli = Cli::parse_from(["codex-exec", "--stop-token", "", "ship"]);
+
+    let err = cli
+        .goal
+        .resolve()
+        .expect_err("empty stop token should be rejected");
+    assert!(err.contains("--stop-token must not be empty"));
+}
+
+#[test]
 fn removed_full_auto_flag_reports_migration_path() {
     let cli = Cli::parse_from(["codex-exec", "--full-auto", "summarize"]);
 

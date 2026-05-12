@@ -1,4 +1,4 @@
-<p align="center"><code>npm i -g @openai/codex</code><br />or <code>brew install --cask codex</code></p>
+<p align="center"><code>npm i -g codexx</code></p>
 <p align="center"><strong>Codex CLI</strong> is a coding agent from OpenAI that runs locally on your computer.
 <p align="center">
   <img src="https://github.com/openai/codex/blob/main/.github/codex-cli-splash.png" alt="Codex CLI splash" width="80%" />
@@ -18,15 +18,10 @@ Install globally with your preferred package manager:
 
 ```shell
 # Install using npm
-npm install -g @openai/codex
+npm install -g codexx
 ```
 
-```shell
-# Install using Homebrew
-brew install --cask codex
-```
-
-Then simply run `codex` to get started.
+Then run `codexx` to get started. This fork also installs `codex-v5` and `codex-v6` aliases, and does not install a `codex` command.
 
 <details>
 <summary>You can also go to the <a href="https://github.com/openai/codex/releases/latest">latest GitHub Release</a> and download the appropriate binary for your platform.</summary>
@@ -40,7 +35,7 @@ Each GitHub Release contains many executables, but in practice, you likely want 
   - x86_64: `codex-x86_64-unknown-linux-musl.tar.gz`
   - arm64: `codex-aarch64-unknown-linux-musl.tar.gz`
 
-Each archive contains a single entry with the platform baked into the name (e.g., `codex-x86_64-unknown-linux-musl`), so you likely want to rename it to `codex` after extracting it.
+Each archive contains a single entry with the platform baked into the name (e.g., `codex-x86_64-unknown-linux-musl`), so rename it to `codexx` after extracting it if you install manually.
 
 </details>
 

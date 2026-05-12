@@ -17,7 +17,7 @@ pub enum StandalonePlatform {
 pub enum InstallContext {
     Standalone {
         /// The managed standalone release directory, for example
-        /// `~/.codex/packages/standalone/releases/0.111.0-x86_64-unknown-linux-musl`.
+        /// `~/.codexx/packages/standalone/releases/0.111.0-x86_64-unknown-linux-musl`.
         release_dir: PathBuf,
         /// The bundled resource directory that sits next to the executable when
         /// this install ships managed dependencies.
@@ -130,13 +130,8 @@ fn standalone_install_context(
     codex_home: Option<&Path>,
 ) -> Option<InstallContext> {
     let canonical_exe = std::fs::canonicalize(exe_path).ok()?;
-    let canonical_codex_home = std::fs::canonicalize(codex_home?).ok()?;
     let release_dir = canonical_exe.parent()?.to_path_buf();
-    let releases_root = canonical_codex_home
-        .join("packages")
-        .join(STANDALONE_PACKAGES_DIRNAME)
-        .join(RELEASES_DIRNAME);
-    if !release_dir.starts_with(releases_root) {
+    if !is_standalone_release_dir(&release_dir, codex_home) {
         return None;
     }
 
@@ -146,6 +141,34 @@ fn standalone_install_context(
         resources_dir: resources_dir.is_dir().then_some(resources_dir),
         platform: standalone_platform(),
     })
+}
+
+fn is_standalone_release_dir(release_dir: &Path, codex_home: Option<&Path>) -> bool {
+    if let Some(canonical_codex_home) = codex_home.and_then(|path| std::fs::canonicalize(path).ok())
+    {
+        let releases_root = canonical_codex_home
+            .join("packages")
+            .join(STANDALONE_PACKAGES_DIRNAME)
+            .join(RELEASES_DIRNAME);
+        if release_dir.starts_with(releases_root) {
+            return true;
+        }
+    }
+
+    let Some(releases_dir) = release_dir.parent() else {
+        return false;
+    };
+    let Some(standalone_dir) = releases_dir.parent() else {
+        return false;
+    };
+    let Some(packages_dir) = standalone_dir.parent() else {
+        return false;
+    };
+
+    releases_dir.file_name().and_then(|name| name.to_str()) == Some(RELEASES_DIRNAME)
+        && standalone_dir.file_name().and_then(|name| name.to_str())
+            == Some(STANDALONE_PACKAGES_DIRNAME)
+        && packages_dir.file_name().and_then(|name| name.to_str()) == Some("packages")
 }
 
 fn standalone_platform() -> StandalonePlatform {

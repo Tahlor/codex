@@ -4,6 +4,7 @@ use clap::Parser;
 use codex_utils_cli::ApprovalModeCliArg;
 use codex_utils_cli::CliConfigOverrides;
 use codex_utils_cli::SharedCliOptions;
+use std::path::PathBuf;
 
 #[derive(Parser, Debug)]
 #[command(version)]
@@ -11,6 +12,10 @@ pub struct Cli {
     /// Optional user prompt to start the session.
     #[arg(value_name = "PROMPT", value_hint = clap::ValueHint::Other)]
     pub prompt: Option<String>,
+
+    /// Internal: parse the startup prompt through slash-command dispatch.
+    #[clap(skip)]
+    pub initial_prompt_parse_slash: bool,
 
     // Internal controls set by the top-level `codex resume` subcommand.
     // These are not exposed as user flags on the base `codex` command.
@@ -32,6 +37,10 @@ pub struct Cli {
     /// Internal: include non-interactive sessions in resume listings.
     #[clap(skip)]
     pub resume_include_non_interactive: bool,
+
+    /// Internal: resolve a resume target but start a fresh thread with a bounded handoff.
+    #[clap(skip)]
+    pub fresh_resume: Option<FreshResumeCliOptions>,
 
     // Internal controls set by the top-level `codex fork` subcommand.
     // These are not exposed as user flags on the base `codex` command.
@@ -71,6 +80,16 @@ pub struct Cli {
 
     #[clap(skip)]
     pub config_overrides: CliConfigOverrides,
+}
+
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct FreshResumeCliOptions {
+    pub first_goal: bool,
+    pub last_goal: bool,
+    pub status_file: Option<PathBuf>,
+    pub context_file: Option<PathBuf>,
+    pub handoff_dir: Option<PathBuf>,
+    pub v6_profile: bool,
 }
 
 impl std::ops::Deref for Cli {

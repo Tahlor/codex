@@ -566,6 +566,7 @@ pub(crate) struct ChatWidgetInit {
     /// construction provides a runner for the active app-server session.
     pub(crate) workspace_command_runner: Option<WorkspaceCommandRunner>,
     pub(crate) initial_user_message: Option<UserMessage>,
+    pub(crate) initial_user_message_parse_slash: bool,
     pub(crate) enhanced_keys_supported: bool,
     pub(crate) has_chatgpt_account: bool,
     pub(crate) model_catalog: Arc<ModelCatalog>,
@@ -773,6 +774,7 @@ pub(crate) struct ChatWidget {
     session_telemetry: SessionTelemetry,
     session_header: SessionHeader,
     initial_user_message: Option<UserMessage>,
+    initial_user_message_parse_slash: bool,
     status_account_display: Option<StatusAccountDisplay>,
     runtime_model_provider_base_url: Option<String>,
     token_info: Option<TokenUsageInfo>,
@@ -2152,7 +2154,7 @@ impl ChatWidget {
             if self.suppress_initial_user_message_submit {
                 self.initial_user_message = Some(user_message);
             } else {
-                self.submit_user_message(user_message);
+                self.submit_initial_user_message(user_message);
             }
         }
         if display == SessionConfiguredDisplay::Normal
@@ -2171,7 +2173,7 @@ impl ChatWidget {
 
     pub(crate) fn submit_initial_user_message_if_pending(&mut self) {
         if let Some(user_message) = self.initial_user_message.take() {
-            self.submit_user_message(user_message);
+            self.submit_initial_user_message(user_message);
         }
     }
 
@@ -4846,6 +4848,7 @@ impl ChatWidget {
             app_event_tx,
             workspace_command_runner,
             initial_user_message,
+            initial_user_message_parse_slash,
             enhanced_keys_supported,
             has_chatgpt_account,
             model_catalog,
@@ -4940,6 +4943,7 @@ impl ChatWidget {
             session_telemetry,
             session_header: SessionHeader::new(header_model),
             initial_user_message,
+            initial_user_message_parse_slash,
             status_account_display,
             runtime_model_provider_base_url,
             token_info: None,
@@ -5622,6 +5626,15 @@ impl ChatWidget {
             user_message,
             UserMessageHistoryRecord::UserMessageText,
         );
+    }
+
+    fn submit_initial_user_message(&mut self, user_message: UserMessage) {
+        if self.initial_user_message_parse_slash {
+            self.initial_user_message_parse_slash = false;
+            let _ = self.submit_queued_slash_prompt(user_message);
+        } else {
+            self.submit_user_message(user_message);
+        }
     }
 
     fn submit_user_message_with_history_record(
@@ -9935,7 +9948,7 @@ impl ChatWidget {
 
     fn rename_confirmation_cell(name: &str, thread_id: Option<ThreadId>) -> PlainHistoryCell {
         let resume_cmd = crate::legacy_core::util::resume_command(Some(name), thread_id)
-            .unwrap_or_else(|| format!("codex resume {name}"));
+            .unwrap_or_else(|| format!("codexx resume {name}"));
         let name = name.to_string();
         let line = vec![
             "• ".into(),

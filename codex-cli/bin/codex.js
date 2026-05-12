@@ -13,12 +13,12 @@ const __dirname = path.dirname(__filename);
 const require = createRequire(import.meta.url);
 
 const PLATFORM_PACKAGE_BY_TARGET = {
-  "x86_64-unknown-linux-musl": "@openai/codex-linux-x64",
-  "aarch64-unknown-linux-musl": "@openai/codex-linux-arm64",
-  "x86_64-apple-darwin": "@openai/codex-darwin-x64",
-  "aarch64-apple-darwin": "@openai/codex-darwin-arm64",
-  "x86_64-pc-windows-msvc": "@openai/codex-win32-x64",
-  "aarch64-pc-windows-msvc": "@openai/codex-win32-arm64",
+  "x86_64-unknown-linux-musl": "codexx-linux-x64",
+  "aarch64-unknown-linux-musl": "codexx-linux-arm64",
+  "x86_64-apple-darwin": "codexx-darwin-x64",
+  "aarch64-apple-darwin": "codexx-darwin-arm64",
+  "x86_64-pc-windows-msvc": "codexx-win32-x64",
+  "aarch64-pc-windows-msvc": "codexx-win32-arm64",
 };
 
 const { platform, arch } = process;
@@ -95,8 +95,8 @@ try {
     const packageManager = detectPackageManager();
     const updateCommand =
       packageManager === "bun"
-        ? "bun install -g @openai/codex@latest"
-        : "npm install -g @openai/codex@latest";
+        ? "bun install -g codexx@latest"
+        : "npm install -g codexx@latest";
     throw new Error(
       `Missing optional dependency ${platformPackage}. Reinstall Codex: ${updateCommand}`,
     );
@@ -107,8 +107,8 @@ if (!vendorRoot) {
   const packageManager = detectPackageManager();
   const updateCommand =
     packageManager === "bun"
-      ? "bun install -g @openai/codex@latest"
-      : "npm install -g @openai/codex@latest";
+      ? "bun install -g codexx@latest"
+      : "npm install -g codexx@latest";
   throw new Error(
     `Missing optional dependency ${platformPackage}. Reinstall Codex: ${updateCommand}`,
   );
@@ -172,7 +172,29 @@ const packageManagerEnvVar =
     : "CODEX_MANAGED_BY_NPM";
 env[packageManagerEnvVar] = "1";
 
-const child = spawn(binaryPath, process.argv.slice(2), {
+function launcherModeArgs(userArgs) {
+  if (userArgs.some((arg) => arg === "--mode" || arg.startsWith("--mode="))) {
+    return [];
+  }
+
+  const wrapperMode = process.env.CODEX_WRAPPER_MODE;
+  if (wrapperMode === "v5" || wrapperMode === "v6") {
+    return ["--mode", wrapperMode];
+  }
+
+  const launcher = process.argv[1] || "";
+  const launcherName = path.basename(launcher, path.extname(launcher));
+  if (launcherName === "codex-v5") {
+    return ["--mode", "v5"];
+  }
+  if (launcherName === "codex-v6") {
+    return ["--mode", "v6"];
+  }
+  return [];
+}
+
+const userArgs = process.argv.slice(2);
+const child = spawn(binaryPath, [...launcherModeArgs(userArgs), ...userArgs], {
   stdio: "inherit",
   env,
 });

@@ -54,6 +54,54 @@ fn rendered_insert_history(events: &[AppEvent]) -> String {
         .join("\n")
 }
 
+fn configured_session(thread_id: ThreadId) -> crate::session_state::ThreadSessionState {
+    crate::session_state::ThreadSessionState {
+        thread_id,
+        forked_from_id: None,
+        fork_parent_title: None,
+        thread_name: None,
+        model: "test-model".to_string(),
+        model_provider_id: "test-provider".to_string(),
+        service_tier: None,
+        approval_policy: AskForApproval::Never,
+        approvals_reviewer: ApprovalsReviewer::User,
+        permission_profile: PermissionProfile::read_only(),
+        active_permission_profile: None,
+        cwd: test_path_buf("/home/user/project").abs(),
+        instruction_source_paths: Vec::new(),
+        reasoning_effort: Some(ReasoningEffortConfig::default()),
+        message_history: None,
+        network_proxy: None,
+        rollout_path: None,
+    }
+}
+
+#[tokio::test]
+async fn initial_user_message_parse_slash_sets_goal_without_user_turn() {
+    let (mut chat, mut rx, mut op_rx) = make_chatwidget_manual(/*model_override*/ None).await;
+    chat.set_feature_enabled(Feature::Goals, /*enabled*/ true);
+    let thread_id = ThreadId::new();
+    chat.initial_user_message =
+        create_initial_user_message(Some("/goal ship this".to_string()), Vec::new(), Vec::new());
+    chat.initial_user_message_parse_slash = true;
+
+    chat.handle_thread_session(configured_session(thread_id));
+
+    let events = drain_app_events(&mut rx);
+    assert!(
+        events.iter().any(|event| matches!(
+            event,
+            AppEvent::SetThreadGoalObjective {
+                thread_id: actual_thread_id,
+                objective,
+                ..
+            } if *actual_thread_id == thread_id && objective == "ship this"
+        )),
+        "expected startup /goal to emit SetThreadGoalObjective, got {events:?}"
+    );
+    assert_no_submit_op(&mut op_rx);
+}
+
 #[tokio::test]
 async fn goal_slash_command_accepts_objective_at_limit() {
     let (mut chat, mut rx, mut op_rx) = make_chatwidget_manual(/*model_override*/ None).await;

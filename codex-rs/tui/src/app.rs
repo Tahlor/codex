@@ -115,6 +115,7 @@ use codex_app_server_protocol::ServerRequest;
 use codex_app_server_protocol::SkillErrorInfo;
 use codex_app_server_protocol::SkillsListParams;
 use codex_app_server_protocol::SkillsListResponse;
+use codex_app_server_protocol::ThreadGoalStatus as AppThreadGoalStatus;
 use codex_app_server_protocol::ThreadItem;
 use codex_app_server_protocol::ThreadLoadedListParams;
 use codex_app_server_protocol::ThreadMemoryMode;
@@ -579,6 +580,7 @@ impl App {
             app_event_tx: self.app_event_tx.clone(),
             workspace_command_runner: self.workspace_command_runner.clone(),
             initial_user_message,
+            initial_user_message_parse_slash: false,
             enhanced_keys_supported: self.enhanced_keys_supported,
             has_chatgpt_account: self.chat_widget.has_chatgpt_account(),
             model_catalog: self.model_catalog.clone(),
@@ -607,7 +609,9 @@ impl App {
         harness_overrides: ConfigOverrides,
         active_profile: Option<String>,
         initial_prompt: Option<String>,
+        initial_prompt_parse_slash: bool,
         initial_images: Vec<PathBuf>,
+        initial_goal_objective: Option<String>,
         session_selection: SessionSelection,
         feedback: codex_feedback::CodexFeedback,
         is_first_run: bool,
@@ -734,6 +738,16 @@ impl App {
         let (mut chat_widget, initial_started_thread) = match session_selection {
             SessionSelection::StartFresh | SessionSelection::Exit => {
                 let started = app_server.start_thread(&config).await?;
+                if let Some(objective) = initial_goal_objective.as_deref() {
+                    app_server
+                        .thread_goal_set(
+                            started.session.thread_id,
+                            Some(objective.to_string()),
+                            Some(AppThreadGoalStatus::Active),
+                            /*token_budget*/ None,
+                        )
+                        .await?;
+                }
                 let startup_tooltip_override =
                     prepare_startup_tooltip_override(&mut config, &available_models, is_first_run)
                         .await;
@@ -748,6 +762,7 @@ impl App {
                         // CLI prompt args are plain strings, so they don't provide element ranges.
                         Vec::new(),
                     ),
+                    initial_user_message_parse_slash: initial_prompt_parse_slash,
                     enhanced_keys_supported,
                     has_chatgpt_account,
                     model_catalog: model_catalog.clone(),
@@ -784,6 +799,7 @@ impl App {
                         // CLI prompt args are plain strings, so they don't provide element ranges.
                         Vec::new(),
                     ),
+                    initial_user_message_parse_slash: initial_prompt_parse_slash,
                     enhanced_keys_supported,
                     has_chatgpt_account,
                     model_catalog: model_catalog.clone(),
@@ -825,6 +841,7 @@ impl App {
                         // CLI prompt args are plain strings, so they don't provide element ranges.
                         Vec::new(),
                     ),
+                    initial_user_message_parse_slash: initial_prompt_parse_slash,
                     enhanced_keys_supported,
                     has_chatgpt_account,
                     model_catalog: model_catalog.clone(),

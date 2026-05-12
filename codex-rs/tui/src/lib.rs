@@ -49,6 +49,9 @@ use codex_protocol::ThreadId;
 use codex_protocol::config_types::AltScreenMode;
 use codex_protocol::config_types::SandboxMode;
 use codex_protocol::config_types::WindowsSandboxLevel;
+use codex_protocol::protocol::EventMsg;
+use codex_protocol::protocol::RolloutItem;
+use codex_protocol::protocol::RolloutLine;
 use codex_rollout::StateDbHandle;
 use codex_rollout::state_db;
 use codex_state::log_db;
@@ -259,6 +262,7 @@ use crate::onboarding::onboarding_screen::OnboardingScreenArgs;
 use crate::onboarding::onboarding_screen::run_onboarding_app;
 use crate::tui::Tui;
 pub use cli::Cli;
+pub use cli::FreshResumeCliOptions;
 use codex_arg0::Arg0DispatchPaths;
 pub use markdown_render::render_markdown_text;
 pub use public_widgets::composer_input::ComposerAction;
@@ -629,6 +633,263 @@ async fn lookup_latest_session_target_with_app_server(
         .data
         .into_iter()
         .find_map(session_target_from_app_server_thread))
+}
+
+#[derive(Clone, Copy, Debug)]
+enum HistoricalGoalPick {
+    First,
+    Last,
+}
+
+#[derive(Clone, Debug)]
+struct FreshResumeHandoff {
+    status_file: PathBuf,
+    context_file: PathBuf,
+}
+
+fn resolve_workspace_path(cwd: &Path, path: PathBuf) -> PathBuf {
+    if path.is_absolute() {
+        path
+    } else {
+        cwd.join(path)
+    }
+}
+
+fn ensure_file_with_default(path: &Path, contents: &str) -> std::io::Result<()> {
+    if let Some(parent) = path.parent() {
+        std::fs::create_dir_all(parent)?;
+    }
+    if !path.exists() {
+        std::fs::write(path, contents)?;
+    }
+    Ok(())
+}
+
+fn default_fresh_resume_handoff_dir(
+    config: &Config,
+    options: &FreshResumeCliOptions,
+    source_thread_id: ThreadId,
+) -> PathBuf {
+    let relative = options.handoff_dir.clone().unwrap_or_else(|| {
+        let root = if options.v6_profile {
+            ".codex-v6"
+        } else {
+            ".codex"
+        };
+        PathBuf::from(root)
+            .join("sessions")
+            .join(source_thread_id.to_string())
+    });
+    resolve_workspace_path(config.cwd.as_path(), relative)
+}
+
+fn prepare_fresh_resume_handoff(
+    config: &Config,
+    options: &FreshResumeCliOptions,
+    target_session: &resume_picker::SessionTarget,
+    objective: &str,
+) -> std::io::Result<FreshResumeHandoff> {
+    let default_dir = default_fresh_resume_handoff_dir(config, options, target_session.thread_id);
+    let status_file = options
+        .status_file
+        .clone()
+        .unwrap_or_else(|| default_dir.join("STATUS.md"));
+    let context_file = options
+        .context_file
+        .clone()
+        .unwrap_or_else(|| default_dir.join("RECOVERY_CONTEXT.md"));
+    let status_file = resolve_workspace_path(config.cwd.as_path(), status_file);
+    let context_file = resolve_workspace_path(config.cwd.as_path(), context_file);
+    let source_rollout = target_session
+        .path
+        .as_ref()
+        .map(|path| path.display().to_string())
+        .unwrap_or_else(|| "not available from the app-server response".to_string());
+    let status_contents = format!(
+        "# Codex Status\n\nFresh resume source thread: {}\n\n",
+        target_session.thread_id
+    );
+    let context_contents = format!(
+        "# Codex v6 Resume Context\n\n\
+This is a bounded handoff for a fresh Codex session. The old thread history is not loaded automatically.\n\n\
+Source thread: {}\n\
+Source rollout: {}\n\n\
+Recovered goal:\n{}\n\n\
+Use this file for curated context and the status file for durable progress. Inspect the source rollout only if more detail is required.\n",
+        target_session.thread_id, source_rollout, objective
+    );
+
+    ensure_file_with_default(&status_file, &status_contents)?;
+    ensure_file_with_default(&context_file, &context_contents)?;
+
+    Ok(FreshResumeHandoff {
+        status_file,
+        context_file,
+    })
+}
+
+fn build_fresh_resume_prompt(
+    target_session: &resume_picker::SessionTarget,
+    objective: &str,
+    handoff: &FreshResumeHandoff,
+    extra_prompt: Option<&str>,
+) -> String {
+    let source_detail = target_session
+        .path
+        .as_ref()
+        .map(|path| format!("Source rollout: `{}`\n", path.display()))
+        .unwrap_or_default();
+    let extra = extra_prompt
+        .map(str::trim)
+        .filter(|prompt| !prompt.is_empty())
+        .map(|prompt| format!("\nAdditional user instruction:\n{prompt}\n"))
+        .unwrap_or_default();
+
+    format!(
+        "You are finishing work that began in another Codex session.\n\n\
+This is a fresh continuation, not a native session resume. The previous thread history is not loaded.\n\n\
+Source thread: `{}`\n{}\
+Recovered goal:\n{}\n{}\
+Read the bounded context at `{}` before continuing. Keep the durable status file at `{}` current. If more detail is needed, inspect the source rollout or use the source thread id above to find the saved session.\n\n\
+Continue the recovered goal from here.",
+        target_session.thread_id,
+        source_detail,
+        objective,
+        extra,
+        handoff.context_file.display(),
+        handoff.status_file.display()
+    )
+}
+
+async fn recover_fresh_resume_objective(
+    app_server: &mut AppServerSession,
+    config: &Config,
+    state_db: Option<&StateDbHandle>,
+    target_session: &resume_picker::SessionTarget,
+    options: &FreshResumeCliOptions,
+) -> color_eyre::Result<String> {
+    if options.first_goal || options.last_goal {
+        let pick = if options.first_goal {
+            HistoricalGoalPick::First
+        } else {
+            HistoricalGoalPick::Last
+        };
+        if let Some(objective) =
+            recover_historical_goal_objective(config, state_db, target_session, pick).await?
+        {
+            return Ok(objective);
+        }
+        if options.last_goal
+            && let Some(objective) =
+                recover_current_goal_objective(app_server, target_session.thread_id).await?
+        {
+            return Ok(objective);
+        }
+        color_eyre::eyre::bail!(
+            "no stored goal found for thread {}",
+            target_session.thread_id
+        );
+    }
+
+    if let Some(objective) =
+        recover_current_goal_objective(app_server, target_session.thread_id).await?
+    {
+        return Ok(objective);
+    }
+    if let Some(objective) = recover_historical_goal_objective(
+        config,
+        state_db,
+        target_session,
+        HistoricalGoalPick::Last,
+    )
+    .await?
+    {
+        return Ok(objective);
+    }
+
+    color_eyre::eyre::bail!(
+        "no stored goal found for thread {}",
+        target_session.thread_id
+    )
+}
+
+async fn recover_current_goal_objective(
+    app_server: &mut AppServerSession,
+    thread_id: ThreadId,
+) -> color_eyre::Result<Option<String>> {
+    let response = app_server.thread_goal_get(thread_id).await?;
+    Ok(response.goal.map(|goal| goal.objective))
+}
+
+async fn recover_historical_goal_objective(
+    config: &Config,
+    state_db: Option<&StateDbHandle>,
+    target_session: &resume_picker::SessionTarget,
+    pick: HistoricalGoalPick,
+) -> color_eyre::Result<Option<String>> {
+    if let Some(path) = target_session.path.as_deref() {
+        return goal_objective_from_rollout_path(path, pick).await;
+    }
+
+    let path = codex_rollout::find_thread_path_by_id_str(
+        &config.codex_home,
+        &target_session.thread_id.to_string(),
+        state_db.map(|handle| handle.as_ref()),
+    )
+    .await?;
+    let Some(path) = path else {
+        return Ok(None);
+    };
+    goal_objective_from_rollout_path(path.as_path(), pick).await
+}
+
+async fn goal_objective_from_rollout_path(
+    path: &Path,
+    pick: HistoricalGoalPick,
+) -> color_eyre::Result<Option<String>> {
+    let text = match tokio::fs::read_to_string(path).await {
+        Ok(text) => text,
+        Err(err) if err.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+        Err(err) => return Err(err.into()),
+    };
+    let mut selected = None;
+    for line in text.lines() {
+        let trimmed = line.trim();
+        if trimmed.is_empty() {
+            continue;
+        }
+        let Ok(rollout_line) = serde_json::from_str::<RolloutLine>(trimmed) else {
+            continue;
+        };
+        let RolloutItem::EventMsg(EventMsg::ThreadGoalUpdated(event)) = rollout_line.item else {
+            continue;
+        };
+        if event.goal.objective.trim().is_empty() {
+            continue;
+        }
+        match pick {
+            HistoricalGoalPick::First => return Ok(Some(event.goal.objective)),
+            HistoricalGoalPick::Last => selected = Some(event.goal.objective),
+        }
+    }
+    Ok(selected)
+}
+
+async fn prepare_fresh_resume_startup(
+    app_server: &mut AppServerSession,
+    config: &Config,
+    state_db: Option<&StateDbHandle>,
+    target_session: &resume_picker::SessionTarget,
+    options: &FreshResumeCliOptions,
+    extra_prompt: Option<&str>,
+) -> color_eyre::Result<(String, String)> {
+    let objective =
+        recover_fresh_resume_objective(app_server, config, state_db, target_session, options)
+            .await?;
+    let handoff = prepare_fresh_resume_handoff(config, options, target_session, &objective)?;
+    let startup_prompt =
+        build_fresh_resume_prompt(target_session, &objective, &handoff, extra_prompt);
+    Ok((objective, startup_prompt))
 }
 
 fn latest_session_lookup_params(
@@ -1084,7 +1345,7 @@ pub async fn run_main(
 
 #[allow(clippy::too_many_arguments)]
 async fn run_ratatui_app(
-    cli: Cli,
+    mut cli: Cli,
     arg0_paths: Arg0DispatchPaths,
     loader_overrides: LoaderOverrides,
     app_server_target: AppServerTarget,
@@ -1264,6 +1525,8 @@ async fn run_ratatui_app(
         })
     };
 
+    let fresh_resume_options = cli.fresh_resume.clone();
+    let mut fresh_resume_target: Option<resume_picker::SessionTarget> = None;
     let use_fork = cli.fork_picker || cli.fork_last || cli.fork_session_id.is_some();
     let session_selection = if use_fork {
         if let Some(id_str) = cli.fork_session_id.as_deref() {
@@ -1307,6 +1570,78 @@ async fn run_ratatui_app(
             )
             .await?
             {
+                resume_picker::SessionSelection::Exit => {
+                    terminal_restore_guard.restore_silently();
+                    session_log::log_session_end();
+                    return Ok(AppExitInfo {
+                        token_usage: crate::token_usage::TokenUsage::default(),
+                        thread_id: None,
+                        thread_name: None,
+                        update_action: None,
+                        exit_reason: ExitReason::UserRequested,
+                    });
+                }
+                other => other,
+            }
+        } else {
+            resume_picker::SessionSelection::StartFresh
+        }
+    } else if fresh_resume_options.is_some() {
+        if let Some(id_str) = cli.resume_session_id.as_deref() {
+            let Some(startup_app_server) = app_server.as_mut() else {
+                unreachable!("app server should be initialized for --fresh-resume <id>");
+            };
+            match lookup_session_target_with_app_server(startup_app_server, id_str).await? {
+                Some(target_session) => {
+                    fresh_resume_target = Some(target_session);
+                    resume_picker::SessionSelection::StartFresh
+                }
+                None => {
+                    shutdown_app_server_if_present(app_server.take()).await;
+                    return missing_session_exit(id_str, "resume");
+                }
+            }
+        } else if cli.resume_last {
+            let filter_cwd = latest_session_cwd_filter(
+                remote_mode,
+                remote_cwd_override.as_deref(),
+                &config,
+                cli.resume_show_all,
+            );
+            let Some(app_server) = app_server.as_mut() else {
+                unreachable!("app server should be initialized for --fresh-resume --last");
+            };
+            match lookup_latest_session_target_with_app_server(
+                app_server,
+                &config,
+                filter_cwd,
+                cli.resume_include_non_interactive,
+            )
+            .await?
+            {
+                Some(target_session) => {
+                    fresh_resume_target = Some(target_session);
+                    resume_picker::SessionSelection::StartFresh
+                }
+                None => resume_picker::SessionSelection::StartFresh,
+            }
+        } else if cli.resume_picker {
+            let Some(app_server) = app_server.take() else {
+                unreachable!("app server should be initialized for --fresh-resume picker");
+            };
+            match resume_picker::run_resume_picker_with_app_server(
+                &mut tui,
+                &config,
+                cli.resume_show_all,
+                cli.resume_include_non_interactive,
+                app_server,
+            )
+            .await?
+            {
+                resume_picker::SessionSelection::Resume(target_session) => {
+                    fresh_resume_target = Some(target_session);
+                    resume_picker::SessionSelection::StartFresh
+                }
                 resume_picker::SessionSelection::Exit => {
                     terminal_restore_guard.restore_silently();
                     session_log::log_session_end();
@@ -1433,7 +1768,8 @@ async fn run_ratatui_app(
     let picker_cancelled_without_selection = matches!(
         session_selection,
         resume_picker::SessionSelection::StartFresh
-    ) && (cli.resume_picker || cli.fork_picker);
+    ) && fresh_resume_target.is_none()
+        && (cli.resume_picker || cli.fork_picker);
 
     let mut config = match &session_selection {
         resume_picker::SessionSelection::Resume(_) | resume_picker::SessionSelection::Fork(_) => {
@@ -1473,17 +1809,7 @@ async fn run_ratatui_app(
         && trust_decision_was_made
         && WindowsSandboxLevel::from_config(&config) == WindowsSandboxLevel::Disabled;
 
-    let Cli {
-        prompt,
-        shared,
-        no_alt_screen,
-        ..
-    } = cli;
-    let images = shared.into_inner().images;
-
-    let use_alt_screen = determine_alt_screen_mode(no_alt_screen, config.tui_alternate_screen);
-    tui.set_alt_screen_enabled(use_alt_screen);
-    let app_server = match app_server {
+    let mut app_server = match app_server {
         Some(app_server) => app_server,
         None => match start_app_server(
             &app_server_target,
@@ -1509,6 +1835,55 @@ async fn run_ratatui_app(
         },
     };
 
+    let initial_goal_objective = match (fresh_resume_options.as_ref(), fresh_resume_target.as_ref())
+    {
+        (Some(options), Some(target_session)) => {
+            match prepare_fresh_resume_startup(
+                &mut app_server,
+                &config,
+                state_db.as_ref(),
+                target_session,
+                options,
+                cli.prompt.as_deref(),
+            )
+            .await
+            {
+                Ok((objective, startup_prompt)) => {
+                    cli.prompt = Some(startup_prompt);
+                    cli.initial_prompt_parse_slash = false;
+                    Some(objective)
+                }
+                Err(err) => {
+                    terminal_restore_guard.restore_silently();
+                    session_log::log_session_end();
+                    let _ = tui.terminal.clear();
+                    return Ok(AppExitInfo {
+                        token_usage: crate::token_usage::TokenUsage::default(),
+                        thread_id: None,
+                        thread_name: None,
+                        update_action: None,
+                        exit_reason: ExitReason::Fatal(format!(
+                            "Failed to prepare fresh resume handoff: {err}"
+                        )),
+                    });
+                }
+            }
+        }
+        _ => None,
+    };
+
+    let Cli {
+        prompt,
+        initial_prompt_parse_slash,
+        shared,
+        no_alt_screen,
+        ..
+    } = cli;
+    let images = shared.into_inner().images;
+
+    let use_alt_screen = determine_alt_screen_mode(no_alt_screen, config.tui_alternate_screen);
+    tui.set_alt_screen_enabled(use_alt_screen);
+
     let app_result = App::run(
         &mut tui,
         app_server,
@@ -1517,7 +1892,9 @@ async fn run_ratatui_app(
         overrides.clone(),
         active_profile,
         prompt,
+        initial_prompt_parse_slash,
         images,
+        initial_goal_objective,
         session_selection,
         feedback,
         should_show_trust_screen, // Proxy to: is it a first run in this directory?
@@ -1754,6 +2131,125 @@ mod tests {
         };
 
         assert_eq!(target.display_label(), format!("thread {thread_id}"));
+    }
+
+    #[test]
+    fn fresh_resume_prompt_is_explicit_and_points_to_handoff_files() {
+        let thread_id = ThreadId::from_string("123e4567-e89b-12d3-a456-426614174000").unwrap();
+        let target = crate::resume_picker::SessionTarget {
+            path: Some(PathBuf::from("source.jsonl")),
+            thread_id,
+        };
+        let handoff = FreshResumeHandoff {
+            status_file: PathBuf::from(".codex-v6/sessions/source/STATUS.md"),
+            context_file: PathBuf::from(".codex-v6/sessions/source/RECOVERY_CONTEXT.md"),
+        };
+
+        let prompt = build_fresh_resume_prompt(
+            &target,
+            "ship the fix",
+            &handoff,
+            Some("also run the focused tests"),
+        );
+
+        assert!(prompt.contains("fresh continuation, not a native session resume"));
+        assert!(prompt.contains("Source thread: `123e4567-e89b-12d3-a456-426614174000`"));
+        assert!(prompt.contains("Recovered goal:\nship the fix"));
+        assert!(prompt.contains("Additional user instruction:\nalso run the focused tests"));
+        assert!(prompt.contains(".codex-v6/sessions/source/RECOVERY_CONTEXT.md"));
+        assert!(prompt.contains(".codex-v6/sessions/source/STATUS.md"));
+        assert!(prompt.contains("source rollout"));
+    }
+
+    #[tokio::test]
+    async fn prepare_fresh_resume_handoff_uses_v6_source_dir() {
+        let codex_home = TempDir::new().expect("create temp codex home");
+        let cwd = TempDir::new().expect("create temp cwd");
+        let config = ConfigBuilder::default()
+            .codex_home(codex_home.path().to_path_buf())
+            .fallback_cwd(Some(cwd.path().to_path_buf()))
+            .build()
+            .await
+            .expect("build config");
+        let thread_id = ThreadId::from_string("123e4567-e89b-12d3-a456-426614174000").unwrap();
+        let target = crate::resume_picker::SessionTarget {
+            path: Some(cwd.path().join("source.jsonl")),
+            thread_id,
+        };
+        let options = FreshResumeCliOptions {
+            v6_profile: true,
+            ..Default::default()
+        };
+
+        let handoff = prepare_fresh_resume_handoff(&config, &options, &target, "ship the fix")
+            .expect("prepare handoff");
+
+        let expected_dir = cwd
+            .path()
+            .join(".codex-v6")
+            .join("sessions")
+            .join("123e4567-e89b-12d3-a456-426614174000");
+        assert_eq!(handoff.status_file, expected_dir.join("STATUS.md"));
+        assert_eq!(
+            handoff.context_file,
+            expected_dir.join("RECOVERY_CONTEXT.md")
+        );
+        let context = std::fs::read_to_string(handoff.context_file).expect("read context");
+        assert!(context.contains("old thread history is not loaded automatically"));
+        assert!(context.contains("Recovered goal:\nship the fix"));
+    }
+
+    #[tokio::test]
+    async fn goal_objective_from_rollout_path_picks_first_and_last_goal() {
+        let dir = TempDir::new().expect("create temp dir");
+        let path = dir.path().join("rollout.jsonl");
+        let thread_id = ThreadId::from_string("123e4567-e89b-12d3-a456-426614174000").unwrap();
+        let first = rollout_line_for_goal(thread_id, "first goal");
+        let last = rollout_line_for_goal(thread_id, "last goal");
+        std::fs::write(
+            &path,
+            format!(
+                "{}\n{}\n",
+                serde_json::to_string(&first).expect("serialize first"),
+                serde_json::to_string(&last).expect("serialize last")
+            ),
+        )
+        .expect("write rollout");
+
+        assert_eq!(
+            goal_objective_from_rollout_path(&path, HistoricalGoalPick::First)
+                .await
+                .expect("read first"),
+            Some("first goal".to_string())
+        );
+        assert_eq!(
+            goal_objective_from_rollout_path(&path, HistoricalGoalPick::Last)
+                .await
+                .expect("read last"),
+            Some("last goal".to_string())
+        );
+    }
+
+    fn rollout_line_for_goal(thread_id: ThreadId, objective: &str) -> RolloutLine {
+        RolloutLine {
+            timestamp: "2026-01-01T00:00:00.000Z".to_string(),
+            item: RolloutItem::EventMsg(EventMsg::ThreadGoalUpdated(
+                codex_protocol::protocol::ThreadGoalUpdatedEvent {
+                    thread_id: thread_id.clone(),
+                    turn_id: None,
+                    goal: codex_protocol::protocol::ThreadGoal {
+                        thread_id,
+                        objective: objective.to_string(),
+                        status: codex_protocol::protocol::ThreadGoalStatus::Active,
+                        token_budget: None,
+                        tokens_used: 0,
+                        time_used_seconds: 0,
+                        created_at: 0,
+                        updated_at: 0,
+                    },
+                },
+            )),
+        }
     }
 
     #[test]

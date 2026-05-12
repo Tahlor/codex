@@ -250,6 +250,7 @@ async fn helpers_are_available_and_do_not_panic() {
         app_event_tx: tx,
         workspace_command_runner: None,
         initial_user_message: None,
+        initial_user_message_parse_slash: false,
         enhanced_keys_supported: false,
         has_chatgpt_account: false,
         model_catalog: test_model_catalog(&cfg),

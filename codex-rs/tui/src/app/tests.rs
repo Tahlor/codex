@@ -443,6 +443,7 @@ async fn enqueue_primary_thread_session_replays_turns_before_initial_prompt_subm
             Vec::new(),
             Vec::new(),
         ),
+        initial_user_message_parse_slash: false,
         enhanced_keys_supported: false,
         has_chatgpt_account: false,
         model_catalog: app.model_catalog.clone(),
@@ -4832,6 +4833,7 @@ async fn replace_chat_widget_reseeds_collab_agent_metadata_for_replay() {
         app_event_tx: app.app_event_tx.clone(),
         workspace_command_runner: None,
         initial_user_message: None,
+        initial_user_message_parse_slash: false,
         enhanced_keys_supported: app.enhanced_keys_supported,
         has_chatgpt_account: app.chat_widget.has_chatgpt_account(),
         model_catalog: app.model_catalog.clone(),
@@ -5329,7 +5331,7 @@ async fn session_summary_includes_resume_hint_for_persisted_rollout() {
     );
     assert_eq!(
         summary.resume_command,
-        Some("codex resume 123e4567-e89b-12d3-a456-426614174000".to_string())
+        Some("codexx resume 123e4567-e89b-12d3-a456-426614174000".to_string())
     );
 }
 
@@ -5355,6 +5357,6 @@ async fn session_summary_uses_id_even_when_thread_has_name() {
     .expect("summary");
     assert_eq!(
         summary.resume_command,
-        Some("codex resume 123e4567-e89b-12d3-a456-426614174000".to_string())
+        Some("codexx resume 123e4567-e89b-12d3-a456-426614174000".to_string())
     );
 }

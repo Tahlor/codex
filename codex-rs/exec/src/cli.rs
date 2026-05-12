@@ -9,12 +9,15 @@ use std::path::PathBuf;
 #[derive(Parser, Debug)]
 #[command(
     version,
-    override_usage = "codex exec [OPTIONS] [PROMPT]\n       codex exec [OPTIONS] <COMMAND> [ARGS]"
+    override_usage = "codexx exec [OPTIONS] [PROMPT]\n       codexx exec [OPTIONS] <COMMAND> [ARGS]"
 )]
 pub struct Cli {
     /// Action to perform. If omitted, runs a new non-interactive session.
     #[command(subcommand)]
     pub command: Option<Command>,
+
+    #[clap(flatten)]
+    pub goal: GoalCliOptions,
 
     #[clap(flatten)]
     pub shared: ExecSharedCliOptions,
@@ -104,6 +107,159 @@ impl Cli {
         }
 
         None
+    }
+}
+
+#[derive(Args, Debug, Clone, Default)]
+pub struct GoalCliOptions {
+    /// Use a goal profile: v5 turn loops, v6 fresh-resume recovery.
+    #[arg(long = "mode", value_enum, global = true)]
+    pub mode: Option<GoalMode>,
+
+    /// Create a real thread goal before sending a prompt.
+    #[arg(long = "goal", global = true, default_value_t = false)]
+    pub goal: bool,
+
+    /// Do not create a goal automatically.
+    #[arg(long = "no-goal", global = true, default_value_t = false)]
+    pub no_goal: bool,
+
+    /// Start a new goal thread from resume context.
+    #[arg(long = "fresh-resume", global = true, default_value_t = false)]
+    pub fresh_resume: bool,
+
+    /// Status file to read, create, and keep current.
+    #[arg(long = "status-file", value_name = "FILE", global = true)]
+    pub status_file: Option<PathBuf>,
+
+    /// Context file to read before continuing.
+    #[arg(long = "context-file", value_name = "FILE", global = true)]
+    pub context_file: Option<PathBuf>,
+
+    /// Directory for default handoff files.
+    #[arg(long = "handoff-dir", value_name = "DIR", global = true)]
+    pub handoff_dir: Option<PathBuf>,
+
+    /// Maximum successful goal turns to run.
+    #[arg(short = 't', long = "turns", value_name = "N", global = true)]
+    pub turns: Option<usize>,
+
+    /// Follow-up prompt after the first successful turn.
+    #[arg(short = 'n', long = "next", value_name = "PROMPT", global = true)]
+    pub next: Option<String>,
+
+    /// Use the original prompt for follow-up turns.
+    #[arg(short = 'r', long = "repeat", global = true, default_value_t = false)]
+    pub repeat: bool,
+
+    /// Combine the original and follow-up prompts.
+    #[arg(short = 'b', long = "carry", global = true, default_value_t = false)]
+    pub carry: bool,
+
+    /// Stop turn loops when the final answer has the stop token.
+    #[arg(
+        short = 'e',
+        long = "early-stopping",
+        global = true,
+        default_value_t = false
+    )]
+    pub early_stopping: bool,
+
+    /// Final-answer token meaning no useful work remains.
+    #[arg(long = "stop-token", value_name = "TOKEN", global = true)]
+    pub stop_token: Option<String>,
+
+    /// Fresh-thread recovery attempts per planned turn.
+    #[arg(long = "retries", value_name = "N", global = true)]
+    pub retries: Option<usize>,
+
+    /// Recover the first meaningful stored goal.
+    #[arg(long = "first-goal", global = true, default_value_t = false)]
+    pub first_goal: bool,
+
+    /// Recover the last meaningful stored goal.
+    #[arg(long = "last-goal", global = true, default_value_t = false)]
+    pub last_goal: bool,
+
+    /// Disable automatic fresh-thread recovery.
+    #[arg(long = "no-auto-recover", global = true, default_value_t = false)]
+    pub no_auto_recover: bool,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, ValueEnum)]
+#[value(rename_all = "kebab-case")]
+pub enum GoalMode {
+    V5,
+    V6,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ResolvedGoalCliOptions {
+    pub mode: Option<GoalMode>,
+    pub goal: bool,
+    pub fresh_resume: bool,
+    pub status_file: Option<PathBuf>,
+    pub context_file: Option<PathBuf>,
+    pub handoff_dir: Option<PathBuf>,
+    pub turns: usize,
+    pub next: Option<String>,
+    pub repeat: bool,
+    pub carry: bool,
+    pub early_stopping: bool,
+    pub stop_token: String,
+    pub retries: usize,
+    pub first_goal: bool,
+    pub last_goal: bool,
+    pub auto_recover: bool,
+}
+
+impl GoalCliOptions {
+    pub fn resolve(&self) -> Result<ResolvedGoalCliOptions, String> {
+        if self.first_goal && self.last_goal {
+            return Err("--first-goal and --last-goal cannot be used together".to_string());
+        }
+
+        let profile_goal = matches!(self.mode, Some(GoalMode::V5 | GoalMode::V6));
+        let goal = (self.goal || profile_goal) && !self.no_goal;
+        let fresh_resume = self.fresh_resume || matches!(self.mode, Some(GoalMode::V6));
+        let turns = self.turns.unwrap_or(1);
+        if turns == 0 {
+            return Err("--turns must be greater than 0".to_string());
+        }
+        if self
+            .stop_token
+            .as_deref()
+            .is_some_and(|token| token.is_empty())
+        {
+            return Err("--stop-token must not be empty".to_string());
+        }
+        let retries = self.retries.unwrap_or(2);
+        let repeat = self.repeat;
+        let carry = self.carry || (!repeat && self.next.is_some());
+        let auto_recover = !self.no_auto_recover
+            && (matches!(self.mode, Some(GoalMode::V5 | GoalMode::V6)) || self.retries.is_some());
+
+        Ok(ResolvedGoalCliOptions {
+            mode: self.mode,
+            goal,
+            fresh_resume,
+            status_file: self.status_file.clone(),
+            context_file: self.context_file.clone(),
+            handoff_dir: self.handoff_dir.clone(),
+            turns,
+            next: self.next.clone(),
+            repeat,
+            carry,
+            early_stopping: self.early_stopping,
+            stop_token: self
+                .stop_token
+                .clone()
+                .unwrap_or_else(|| "<NOTHING LEFT TO DO>".to_string()),
+            retries,
+            first_goal: self.first_goal,
+            last_goal: self.last_goal,
+            auto_recover,
+        })
     }
 }
 

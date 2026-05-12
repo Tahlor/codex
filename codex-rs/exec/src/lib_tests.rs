@@ -365,6 +365,156 @@ fn turn_items_for_thread_returns_matching_turn_items() {
 }
 
 #[test]
+fn last_agent_message_text_returns_last_agent_message() {
+    let items = vec![
+        AppServerThreadItem::AgentMessage {
+            id: "msg-1".to_string(),
+            text: "first".to_string(),
+            phase: None,
+            memory_citation: None,
+        },
+        AppServerThreadItem::Plan {
+            id: "plan-1".to_string(),
+            text: "plan".to_string(),
+        },
+        AppServerThreadItem::AgentMessage {
+            id: "msg-2".to_string(),
+            text: "last".to_string(),
+            phase: None,
+            memory_citation: None,
+        },
+    ];
+
+    assert_eq!(last_agent_message_text(&items), Some("last".to_string()));
+}
+
+#[test]
+fn should_stop_after_turn_requires_stop_token_in_final_message() {
+    let options = crate::cli::GoalCliOptions {
+        early_stopping: true,
+        ..Default::default()
+    }
+    .resolve()
+    .expect("goal options should resolve");
+    let outcome = TurnRunOutcome {
+        error_seen: false,
+        final_agent_message: Some("Done. <NOTHING LEFT TO DO>".to_string()),
+    };
+
+    assert!(should_stop_after_turn(&outcome, &options));
+}
+
+#[tokio::test]
+async fn goal_objective_from_rollout_path_picks_first_and_last_goal() {
+    let dir = tempdir().expect("create tempdir");
+    let path = dir.path().join("rollout.jsonl");
+    let thread_id =
+        ThreadId::from_string("00000000-0000-0000-0000-000000000001").expect("valid thread id");
+    let first = rollout_line_for_goal(thread_id, "first useful goal");
+    let last = rollout_line_for_goal(thread_id, "last useful goal");
+    std::fs::write(
+        &path,
+        format!(
+            "{}\n{}\n",
+            serde_json::to_string(&first).expect("serialize first goal"),
+            serde_json::to_string(&last).expect("serialize last goal")
+        ),
+    )
+    .expect("write rollout");
+
+    assert_eq!(
+        goal_objective_from_rollout_path(&path, HistoricalGoalPick::First)
+            .await
+            .expect("read first goal"),
+        Some("first useful goal".to_string())
+    );
+    assert_eq!(
+        goal_objective_from_rollout_path(&path, HistoricalGoalPick::Last)
+            .await
+            .expect("read last goal"),
+        Some("last useful goal".to_string())
+    );
+}
+
+#[tokio::test]
+async fn prepare_goal_handoff_defaults_status_for_goal_mode() {
+    let codex_home = tempdir().expect("create temp codex home");
+    let cwd = tempdir().expect("create temp cwd");
+    let config = ConfigBuilder::default()
+        .codex_home(codex_home.path().to_path_buf())
+        .fallback_cwd(Some(cwd.path().to_path_buf()))
+        .build()
+        .await
+        .expect("build config");
+    let options = crate::cli::GoalCliOptions {
+        mode: Some(GoalMode::V5),
+        ..Default::default()
+    }
+    .resolve()
+    .expect("goal options should resolve");
+
+    let handoff = prepare_goal_handoff(&config, &options, None).expect("prepare handoff");
+    let expected_status = cwd
+        .path()
+        .join(".codex")
+        .join("sessions")
+        .join("goal")
+        .join("STATUS.md");
+
+    assert_eq!(handoff.status_file, Some(expected_status.clone()));
+    assert!(expected_status.exists());
+}
+
+#[tokio::test]
+async fn prepare_goal_handoff_handoff_dir_defaults_context() {
+    let codex_home = tempdir().expect("create temp codex home");
+    let cwd = tempdir().expect("create temp cwd");
+    let config = ConfigBuilder::default()
+        .codex_home(codex_home.path().to_path_buf())
+        .fallback_cwd(Some(cwd.path().to_path_buf()))
+        .build()
+        .await
+        .expect("build config");
+    let options = crate::cli::GoalCliOptions {
+        handoff_dir: Some(PathBuf::from("handoff")),
+        ..Default::default()
+    }
+    .resolve()
+    .expect("goal options should resolve");
+
+    let handoff = prepare_goal_handoff(&config, &options, None).expect("prepare handoff");
+    let expected_status = cwd.path().join("handoff").join("STATUS.md");
+    let expected_context = cwd.path().join("handoff").join("RECOVERY_CONTEXT.md");
+
+    assert_eq!(handoff.status_file, Some(expected_status.clone()));
+    assert_eq!(handoff.context_file, Some(expected_context.clone()));
+    assert!(expected_status.exists());
+    assert!(expected_context.exists());
+}
+
+fn rollout_line_for_goal(thread_id: ThreadId, objective: &str) -> RolloutLine {
+    RolloutLine {
+        timestamp: "2026-01-01T00:00:00.000Z".to_string(),
+        item: RolloutItem::EventMsg(EventMsg::ThreadGoalUpdated(
+            codex_protocol::protocol::ThreadGoalUpdatedEvent {
+                thread_id: thread_id.clone(),
+                turn_id: None,
+                goal: codex_protocol::protocol::ThreadGoal {
+                    thread_id,
+                    objective: objective.to_string(),
+                    status: codex_protocol::protocol::ThreadGoalStatus::Active,
+                    token_budget: None,
+                    tokens_used: 0,
+                    time_used_seconds: 0,
+                    created_at: 0,
+                    updated_at: 0,
+                },
+            },
+        )),
+    }
+}
+
+#[test]
 fn should_backfill_turn_completed_items_skips_ephemeral_threads() {
     let notification =
         ServerNotification::TurnCompleted(codex_app_server_protocol::TurnCompletedNotification {

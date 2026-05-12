@@ -1540,6 +1540,7 @@ async fn make_startup_chat_with_cli_overrides(
         app_event_tx: AppEventSender::new(unbounded_channel::<AppEvent>().0),
         workspace_command_runner: None,
         initial_user_message: None,
+        initial_user_message_parse_slash: false,
         enhanced_keys_supported: false,
         has_chatgpt_account: false,
         model_catalog: test_model_catalog(&cfg),
