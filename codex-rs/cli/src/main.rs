@@ -758,21 +758,21 @@ fn main() -> anyhow::Result<()> {
     })
 }
 
-fn apply_arg0_goal_alias(options: &mut GoalCliOptions) {
-    let Some(argv0) = std::env::args_os().next() else {
-        return;
-    };
-    let Some(exe_name) = std::path::Path::new(&argv0)
-        .file_stem()
-        .and_then(|name| name.to_str())
-    else {
-        return;
-    };
-    let alias_mode = match exe_name {
-        "codex-v5" => Some(GoalMode::V5),
-        "codex-v6" => Some(GoalMode::V6),
+fn goal_mode_for_exe_name(exe_name: &str) -> Option<GoalMode> {
+    match exe_name {
+        "codex-v5" | "codexx-v5" => Some(GoalMode::V5),
+        "codex-v6" | "codexx-v6" => Some(GoalMode::V6),
         _ => None,
-    };
+    }
+}
+
+fn apply_arg0_goal_alias(options: &mut GoalCliOptions) {
+    let alias_mode = std::env::args_os().next().and_then(|argv0| {
+        std::path::Path::new(&argv0)
+            .file_stem()
+            .and_then(|name| name.to_str())
+            .and_then(goal_mode_for_exe_name)
+    });
     if options.mode.is_none() {
         options.mode = alias_mode;
     }
@@ -784,6 +784,7 @@ fn root_goal_options_applies_to_exec(options: &GoalCliOptions) -> bool {
     !options.no_goal
         && (options.goal
             || options.fresh_resume
+            || options.status
             || options.status_file.is_some()
             || options.context_file.is_some()
             || options.handoff_dir.is_some()
@@ -864,6 +865,7 @@ fn fresh_resume_options_from_goal_options(
     Ok(Some(FreshResumeCliOptions {
         first_goal: resolved.first_goal,
         last_goal: resolved.last_goal,
+        default_status_file: resolved.default_status_file,
         status_file: resolved.status_file,
         context_file: resolved.context_file,
         handoff_dir: resolved.handoff_dir,
@@ -878,6 +880,8 @@ fn inherit_goal_options(target: &mut GoalCliOptions, root: &GoalCliOptions) {
     target.goal |= root.goal;
     target.no_goal |= root.no_goal;
     target.fresh_resume |= root.fresh_resume;
+    target.status |= root.status;
+    target.no_status |= root.no_status;
     if target.status_file.is_none() {
         target.status_file.clone_from(&root.status_file);
     }
@@ -2084,6 +2088,15 @@ mod tests {
     }
 
     #[test]
+    fn codexx_goal_alias_names_select_goal_modes() {
+        assert_eq!(goal_mode_for_exe_name("codex-v5"), Some(GoalMode::V5));
+        assert_eq!(goal_mode_for_exe_name("codexx-v5"), Some(GoalMode::V5));
+        assert_eq!(goal_mode_for_exe_name("codex-v6"), Some(GoalMode::V6));
+        assert_eq!(goal_mode_for_exe_name("codexx-v6"), Some(GoalMode::V6));
+        assert_eq!(goal_mode_for_exe_name("codexx"), None);
+    }
+
+    #[test]
     fn v6_resume_marks_interactive_resume_as_fresh_handoff() {
         let interactive = finalize_resume_from_args(
             [
@@ -2100,12 +2113,87 @@ mod tests {
             .fresh_resume
             .expect("v6 resume should use fresh handoff");
         assert!(fresh_resume.v6_profile);
+        assert!(fresh_resume.default_status_file);
         assert!(!interactive.resume_picker);
         assert!(!interactive.resume_last);
         assert_eq!(
             interactive.resume_session_id.as_deref(),
             Some("019e13e6-f8bf-7e40-a643-03b3ee50ab25")
         );
+    }
+
+    #[test]
+    fn codexx_v6_resume_marks_interactive_resume_as_fresh_handoff() {
+        let mut cli = MultitoolCli::try_parse_from([
+            "codexx-v6",
+            "resume",
+            "019e13e6-f8bf-7e40-a643-03b3ee50ab25",
+        ])
+        .expect("parse should succeed");
+        if cli.goal.mode.is_none() {
+            cli.goal.mode = goal_mode_for_exe_name("codexx-v6");
+        }
+
+        let MultitoolCli {
+            interactive,
+            config_overrides: root_overrides,
+            subcommand,
+            feature_toggles: _,
+            goal,
+            remote: _,
+        } = cli;
+        let Some(Subcommand::Resume(ResumeCommand {
+            session_id,
+            last,
+            all,
+            include_non_interactive,
+            remote: _,
+            config_overrides: resume_cli,
+        })) = subcommand
+        else {
+            panic!("expected resume subcommand");
+        };
+        let mut interactive = finalize_resume_interactive(
+            interactive,
+            root_overrides,
+            session_id,
+            last,
+            all,
+            include_non_interactive,
+            resume_cli,
+        );
+        interactive.fresh_resume =
+            fresh_resume_options_from_goal_options(&goal).expect("goal options should resolve");
+
+        let fresh_resume = interactive
+            .fresh_resume
+            .expect("codexx-v6 resume should use fresh handoff");
+        assert!(fresh_resume.v6_profile);
+        assert!(fresh_resume.default_status_file);
+        assert_eq!(
+            interactive.resume_session_id.as_deref(),
+            Some("019e13e6-f8bf-7e40-a643-03b3ee50ab25")
+        );
+    }
+
+    #[test]
+    fn no_status_suppresses_v6_fresh_resume_status_file() {
+        let interactive = finalize_resume_from_args(
+            [
+                "codex",
+                "--mode",
+                "v6",
+                "--no-status",
+                "resume",
+                "019e13e6-f8bf-7e40-a643-03b3ee50ab25",
+            ]
+            .as_ref(),
+        );
+
+        let fresh_resume = interactive
+            .fresh_resume
+            .expect("v6 resume should use fresh handoff");
+        assert!(!fresh_resume.default_status_file);
     }
 
     #[test]

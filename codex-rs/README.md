@@ -11,7 +11,7 @@ npm i -g codexx
 codexx
 ```
 
-This fork installs `codexx`, `codex-v5`, and `codex-v6`, and intentionally does not install `codex`.
+This fork installs `codexx`, `codex-v5`, `codex-v6`, `codexx-v5`, and `codexx-v6`, and intentionally does not install `codex`.
 
 ## Documentation quickstart
 

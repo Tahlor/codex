@@ -86,6 +86,7 @@ pub struct Cli {
 pub struct FreshResumeCliOptions {
     pub first_goal: bool,
     pub last_goal: bool,
+    pub default_status_file: bool,
     pub status_file: Option<PathBuf>,
     pub context_file: Option<PathBuf>,
     pub handoff_dir: Option<PathBuf>,

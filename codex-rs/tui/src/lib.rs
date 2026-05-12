@@ -643,8 +643,15 @@ enum HistoricalGoalPick {
 
 #[derive(Clone, Debug)]
 struct FreshResumeHandoff {
-    status_file: PathBuf,
+    status_file: Option<PathBuf>,
     context_file: PathBuf,
+}
+
+#[derive(Clone, Debug)]
+pub(crate) struct FreshResumeStartup {
+    pub(crate) target_session: resume_picker::SessionTarget,
+    pub(crate) options: FreshResumeCliOptions,
+    pub(crate) extra_prompt: Option<String>,
 }
 
 fn resolve_workspace_path(cwd: &Path, path: PathBuf) -> PathBuf {
@@ -668,58 +675,135 @@ fn ensure_file_with_default(path: &Path, contents: &str) -> std::io::Result<()> 
 fn default_fresh_resume_handoff_dir(
     config: &Config,
     options: &FreshResumeCliOptions,
-    source_thread_id: ThreadId,
+    continuation_thread_id: ThreadId,
 ) -> PathBuf {
     let relative = options.handoff_dir.clone().unwrap_or_else(|| {
-        let root = if options.v6_profile {
-            ".codex-v6"
-        } else {
-            ".codex"
-        };
-        PathBuf::from(root)
+        PathBuf::from(".codexx")
             .join("sessions")
-            .join(source_thread_id.to_string())
+            .join(continuation_thread_id.to_string())
     });
     resolve_workspace_path(config.cwd.as_path(), relative)
+}
+
+fn default_fresh_resume_status_path_for_thread(
+    config: &Config,
+    options: &FreshResumeCliOptions,
+    thread_id: ThreadId,
+) -> PathBuf {
+    default_fresh_resume_handoff_dir(config, options, thread_id).join("STATUS.md")
+}
+
+fn default_source_status_path_for_fresh_resume(
+    config: &Config,
+    options: &FreshResumeCliOptions,
+    source_thread_id: ThreadId,
+) -> Option<PathBuf> {
+    if options.status_file.is_some() || options.handoff_dir.is_some() {
+        return None;
+    }
+    Some(default_fresh_resume_status_path_for_thread(
+        config,
+        options,
+        source_thread_id,
+    ))
+}
+
+fn fresh_resume_status_contents(
+    config: &Config,
+    options: &FreshResumeCliOptions,
+    source_thread_id: ThreadId,
+    continuation_thread_id: ThreadId,
+) -> std::io::Result<String> {
+    let Some(source_status_path) =
+        default_source_status_path_for_fresh_resume(config, options, source_thread_id)
+    else {
+        return Ok(format!(
+            "# Codex Status\n\nContinuation thread: {}\nFresh resume source thread: {}\n\n",
+            continuation_thread_id, source_thread_id
+        ));
+    };
+
+    let source_status = match std::fs::read_to_string(&source_status_path) {
+        Ok(text) => Some(text),
+        Err(err) if err.kind() == std::io::ErrorKind::NotFound => None,
+        Err(err) => return Err(err),
+    };
+
+    let mut contents = format!(
+        "# Codex Status\n\nContinuation thread: {}\nFresh resume source thread: {}\n",
+        continuation_thread_id, source_thread_id
+    );
+    if let Some(source_status) = source_status {
+        contents.push_str(&format!(
+            "Copied status from: {}\n\n---\n\n{}\n",
+            source_status_path.display(),
+            source_status.trim_end()
+        ));
+    } else {
+        contents.push('\n');
+    }
+    Ok(contents)
 }
 
 fn prepare_fresh_resume_handoff(
     config: &Config,
     options: &FreshResumeCliOptions,
     target_session: &resume_picker::SessionTarget,
+    continuation_thread_id: ThreadId,
     objective: &str,
 ) -> std::io::Result<FreshResumeHandoff> {
-    let default_dir = default_fresh_resume_handoff_dir(config, options, target_session.thread_id);
-    let status_file = options
-        .status_file
-        .clone()
-        .unwrap_or_else(|| default_dir.join("STATUS.md"));
+    let default_dir = default_fresh_resume_handoff_dir(config, options, continuation_thread_id);
+    let status_file = options.status_file.clone().or_else(|| {
+        options
+            .default_status_file
+            .then(|| default_dir.join("STATUS.md"))
+    });
     let context_file = options
         .context_file
         .clone()
         .unwrap_or_else(|| default_dir.join("RECOVERY_CONTEXT.md"));
-    let status_file = resolve_workspace_path(config.cwd.as_path(), status_file);
+    let status_file = status_file.map(|path| resolve_workspace_path(config.cwd.as_path(), path));
     let context_file = resolve_workspace_path(config.cwd.as_path(), context_file);
     let source_rollout = target_session
         .path
         .as_ref()
         .map(|path| path.display().to_string())
         .unwrap_or_else(|| "not available from the app-server response".to_string());
-    let status_contents = format!(
-        "# Codex Status\n\nFresh resume source thread: {}\n\n",
-        target_session.thread_id
-    );
+    let status_contents = if status_file.is_some() {
+        Some(fresh_resume_status_contents(
+            config,
+            options,
+            target_session.thread_id,
+            continuation_thread_id,
+        )?)
+    } else {
+        None
+    };
+    let status_file_display = status_file
+        .as_deref()
+        .map(|path| path.display().to_string())
+        .unwrap_or_else(|| "not configured".to_string());
     let context_contents = format!(
         "# Codex v6 Resume Context\n\n\
 This is a bounded handoff for a fresh Codex session. The old thread history is not loaded automatically.\n\n\
+Continuation thread: {}\n\
 Source thread: {}\n\
 Source rollout: {}\n\n\
 Recovered goal:\n{}\n\n\
+Status file: {}\n\n\
 Use this file for curated context and the status file for durable progress. Inspect the source rollout only if more detail is required.\n",
-        target_session.thread_id, source_rollout, objective
+        continuation_thread_id,
+        target_session.thread_id,
+        source_rollout,
+        objective,
+        status_file_display
     );
 
-    ensure_file_with_default(&status_file, &status_contents)?;
+    if let (Some(status_file), Some(status_contents)) =
+        (status_file.as_deref(), status_contents.as_deref())
+    {
+        ensure_file_with_default(status_file, status_contents)?;
+    }
     ensure_file_with_default(&context_file, &context_contents)?;
 
     Ok(FreshResumeHandoff {
@@ -744,20 +828,30 @@ fn build_fresh_resume_prompt(
         .filter(|prompt| !prompt.is_empty())
         .map(|prompt| format!("\nAdditional user instruction:\n{prompt}\n"))
         .unwrap_or_default();
+    let status_instruction = handoff
+        .status_file
+        .as_deref()
+        .map(|path| {
+            format!(
+                " Keep the durable status file at `{}` current.",
+                path.display()
+            )
+        })
+        .unwrap_or_default();
 
     format!(
         "You are finishing work that began in another Codex session.\n\n\
 This is a fresh continuation, not a native session resume. The previous thread history is not loaded.\n\n\
 Source thread: `{}`\n{}\
 Recovered goal:\n{}\n{}\
-Read the bounded context at `{}` before continuing. Keep the durable status file at `{}` current. If more detail is needed, inspect the source rollout or use the source thread id above to find the saved session.\n\n\
+Read the bounded context at `{}` before continuing.{} If more detail is needed, inspect the source rollout or use the source thread id above to find the saved session.\n\n\
 Continue the recovered goal from here.",
         target_session.thread_id,
         source_detail,
         objective,
         extra,
         handoff.context_file.display(),
-        handoff.status_file.display()
+        status_instruction
     )
 }
 
@@ -807,10 +901,10 @@ async fn recover_fresh_resume_objective(
         return Ok(objective);
     }
 
-    color_eyre::eyre::bail!(
-        "no stored goal found for thread {}",
-        target_session.thread_id
-    )
+    let thread = app_server
+        .thread_read(target_session.thread_id, /*include_turns*/ false)
+        .await?;
+    Ok(fallback_fresh_resume_objective(&thread))
 }
 
 async fn recover_current_goal_objective(
@@ -819,6 +913,26 @@ async fn recover_current_goal_objective(
 ) -> color_eyre::Result<Option<String>> {
     let response = app_server.thread_goal_get(thread_id).await?;
     Ok(response.goal.map(|goal| goal.objective))
+}
+
+fn fallback_fresh_resume_objective(thread: &AppServerThread) -> String {
+    let source_summary = thread
+        .name
+        .as_deref()
+        .map(str::trim)
+        .filter(|name| !name.is_empty())
+        .or_else(|| {
+            let preview = thread.preview.trim();
+            (!preview.is_empty()).then_some(preview)
+        });
+
+    match source_summary {
+        Some(summary) => format!(
+            "Continue the work from source thread {}. Source summary: {}",
+            thread.id, summary
+        ),
+        None => format!("Continue the work from source thread {}.", thread.id),
+    }
 }
 
 async fn recover_historical_goal_objective(
@@ -881,12 +995,19 @@ async fn prepare_fresh_resume_startup(
     state_db: Option<&StateDbHandle>,
     target_session: &resume_picker::SessionTarget,
     options: &FreshResumeCliOptions,
+    continuation_thread_id: ThreadId,
     extra_prompt: Option<&str>,
 ) -> color_eyre::Result<(String, String)> {
     let objective =
         recover_fresh_resume_objective(app_server, config, state_db, target_session, options)
             .await?;
-    let handoff = prepare_fresh_resume_handoff(config, options, target_session, &objective)?;
+    let handoff = prepare_fresh_resume_handoff(
+        config,
+        options,
+        target_session,
+        continuation_thread_id,
+        &objective,
+    )?;
     let startup_prompt =
         build_fresh_resume_prompt(target_session, &objective, &handoff, extra_prompt);
     Ok((objective, startup_prompt))
@@ -1835,40 +1956,12 @@ async fn run_ratatui_app(
         },
     };
 
-    let initial_goal_objective = match (fresh_resume_options.as_ref(), fresh_resume_target.as_ref())
-    {
-        (Some(options), Some(target_session)) => {
-            match prepare_fresh_resume_startup(
-                &mut app_server,
-                &config,
-                state_db.as_ref(),
-                target_session,
-                options,
-                cli.prompt.as_deref(),
-            )
-            .await
-            {
-                Ok((objective, startup_prompt)) => {
-                    cli.prompt = Some(startup_prompt);
-                    cli.initial_prompt_parse_slash = false;
-                    Some(objective)
-                }
-                Err(err) => {
-                    terminal_restore_guard.restore_silently();
-                    session_log::log_session_end();
-                    let _ = tui.terminal.clear();
-                    return Ok(AppExitInfo {
-                        token_usage: crate::token_usage::TokenUsage::default(),
-                        thread_id: None,
-                        thread_name: None,
-                        update_action: None,
-                        exit_reason: ExitReason::Fatal(format!(
-                            "Failed to prepare fresh resume handoff: {err}"
-                        )),
-                    });
-                }
-            }
-        }
+    let fresh_resume_startup = match (fresh_resume_options.as_ref(), fresh_resume_target.as_ref()) {
+        (Some(options), Some(target_session)) => Some(FreshResumeStartup {
+            target_session: target_session.clone(),
+            options: options.clone(),
+            extra_prompt: cli.prompt.clone(),
+        }),
         _ => None,
     };
 
@@ -1894,7 +1987,8 @@ async fn run_ratatui_app(
         prompt,
         initial_prompt_parse_slash,
         images,
-        initial_goal_objective,
+        None,
+        fresh_resume_startup,
         session_selection,
         feedback,
         should_show_trust_screen, // Proxy to: is it a first run in this directory?
@@ -2141,8 +2235,8 @@ mod tests {
             thread_id,
         };
         let handoff = FreshResumeHandoff {
-            status_file: PathBuf::from(".codex-v6/sessions/source/STATUS.md"),
-            context_file: PathBuf::from(".codex-v6/sessions/source/RECOVERY_CONTEXT.md"),
+            status_file: Some(PathBuf::from(".codexx/sessions/continuation/STATUS.md")),
+            context_file: PathBuf::from(".codexx/sessions/continuation/RECOVERY_CONTEXT.md"),
         };
 
         let prompt = build_fresh_resume_prompt(
@@ -2156,13 +2250,60 @@ mod tests {
         assert!(prompt.contains("Source thread: `123e4567-e89b-12d3-a456-426614174000`"));
         assert!(prompt.contains("Recovered goal:\nship the fix"));
         assert!(prompt.contains("Additional user instruction:\nalso run the focused tests"));
-        assert!(prompt.contains(".codex-v6/sessions/source/RECOVERY_CONTEXT.md"));
-        assert!(prompt.contains(".codex-v6/sessions/source/STATUS.md"));
+        assert!(prompt.contains(".codexx/sessions/continuation/RECOVERY_CONTEXT.md"));
+        assert!(prompt.contains(".codexx/sessions/continuation/STATUS.md"));
         assert!(prompt.contains("source rollout"));
     }
 
+    fn fallback_thread(name: Option<&str>, preview: &str) -> AppServerThread {
+        AppServerThread {
+            id: "123e4567-e89b-12d3-a456-426614174000".to_string(),
+            session_id: "123e4567-e89b-12d3-a456-426614174000".to_string(),
+            forked_from_id: None,
+            preview: preview.to_string(),
+            ephemeral: false,
+            model_provider: "openai".to_string(),
+            created_at: 0,
+            updated_at: 0,
+            status: codex_app_server_protocol::ThreadStatus::Idle,
+            path: None,
+            cwd: AbsolutePathBuf::from_absolute_path(
+                std::env::current_dir().expect("current dir for test"),
+            )
+            .expect("current dir should be absolute"),
+            cli_version: "0.0.0-test".to_string(),
+            source: serde_json::from_value(serde_json::json!("cli"))
+                .expect("cli session source should deserialize"),
+            thread_source: None,
+            agent_nickname: None,
+            agent_role: None,
+            git_info: None,
+            name: name.map(str::to_string),
+            turns: Vec::new(),
+        }
+    }
+
+    #[test]
+    fn fresh_resume_fallback_objective_uses_thread_title_or_preview() {
+        let named = fallback_fresh_resume_objective(&fallback_thread(
+            Some("Saved continuation"),
+            "older first message",
+        ));
+        assert!(named.contains("Saved continuation"));
+        assert!(!named.contains("older first message"));
+
+        let preview = fallback_fresh_resume_objective(&fallback_thread(None, "ship the UI fix"));
+        assert!(preview.contains("ship the UI fix"));
+
+        let empty = fallback_fresh_resume_objective(&fallback_thread(None, "  "));
+        assert_eq!(
+            empty,
+            "Continue the work from source thread 123e4567-e89b-12d3-a456-426614174000."
+        );
+    }
+
     #[tokio::test]
-    async fn prepare_fresh_resume_handoff_uses_v6_source_dir() {
+    async fn prepare_fresh_resume_handoff_uses_v6_continuation_dir_and_copies_status() {
         let codex_home = TempDir::new().expect("create temp codex home");
         let cwd = TempDir::new().expect("create temp cwd");
         let config = ConfigBuilder::default()
@@ -2176,27 +2317,54 @@ mod tests {
             path: Some(cwd.path().join("source.jsonl")),
             thread_id,
         };
+        let continuation_thread_id =
+            ThreadId::from_string("223e4567-e89b-12d3-a456-426614174001").unwrap();
         let options = FreshResumeCliOptions {
             v6_profile: true,
+            default_status_file: true,
             ..Default::default()
         };
+        let source_status = cwd
+            .path()
+            .join(".codexx")
+            .join("sessions")
+            .join("123e4567-e89b-12d3-a456-426614174000")
+            .join("STATUS.md");
+        std::fs::create_dir_all(source_status.parent().expect("source status parent"))
+            .expect("create source status dir");
+        std::fs::write(&source_status, "prior progress\n").expect("write source status");
 
-        let handoff = prepare_fresh_resume_handoff(&config, &options, &target, "ship the fix")
-            .expect("prepare handoff");
+        let handoff = prepare_fresh_resume_handoff(
+            &config,
+            &options,
+            &target,
+            continuation_thread_id,
+            "ship the fix",
+        )
+        .expect("prepare handoff");
 
         let expected_dir = cwd
             .path()
-            .join(".codex-v6")
+            .join(".codexx")
             .join("sessions")
-            .join("123e4567-e89b-12d3-a456-426614174000");
-        assert_eq!(handoff.status_file, expected_dir.join("STATUS.md"));
+            .join("223e4567-e89b-12d3-a456-426614174001");
+        assert_eq!(handoff.status_file, Some(expected_dir.join("STATUS.md")));
         assert_eq!(
             handoff.context_file,
             expected_dir.join("RECOVERY_CONTEXT.md")
         );
         let context = std::fs::read_to_string(handoff.context_file).expect("read context");
         assert!(context.contains("old thread history is not loaded automatically"));
+        assert!(context.contains("Continuation thread: 223e4567-e89b-12d3-a456-426614174001"));
+        assert!(context.contains("Source thread: 123e4567-e89b-12d3-a456-426614174000"));
         assert!(context.contains("Recovered goal:\nship the fix"));
+        let status = std::fs::read_to_string(handoff.status_file.expect("status file"))
+            .expect("read status");
+        assert!(status.contains("Continuation thread: 223e4567-e89b-12d3-a456-426614174001"));
+        assert!(
+            status.contains("Fresh resume source thread: 123e4567-e89b-12d3-a456-426614174000")
+        );
+        assert!(status.contains("prior progress"));
     }
 
     #[tokio::test]

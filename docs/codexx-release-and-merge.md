@@ -3,7 +3,7 @@
 This fork keeps the public install surface separate from the stock OpenAI CLI:
 
 - package name: `codexx`
-- installed commands: `codexx`, `codex-v5`, `codex-v6`
+- installed commands: `codexx`, `codex-v5`, `codex-v6`, `codexx-v5`, `codexx-v6`
 - no installed `codex` command
 
 The native binary inside platform payloads can still be named `codex`; the npm
@@ -43,7 +43,9 @@ dependencies such as `codexx-linux-x64 -> npm:codexx@0.130.0-linux-x64`.
    {
      "codexx": "bin/codex.js",
      "codex-v5": "bin/codex-v5.js",
-     "codex-v6": "bin/codex-v6.js"
+     "codex-v6": "bin/codex-v6.js",
+     "codexx-v5": "bin/codex-v5.js",
+     "codexx-v6": "bin/codex-v6.js"
    }
    ```
 

@@ -132,6 +132,19 @@ pub struct GoalCliOptions {
     #[arg(long = "status-file", value_name = "FILE", global = true)]
     pub status_file: Option<PathBuf>,
 
+    /// Use the default session-scoped status file.
+    #[arg(long = "status", global = true, default_value_t = false)]
+    pub status: bool,
+
+    /// Disable the default session-scoped status file.
+    #[arg(
+        long = "no-status",
+        global = true,
+        default_value_t = false,
+        conflicts_with_all = ["status", "status_file"]
+    )]
+    pub no_status: bool,
+
     /// Context file to read before continuing.
     #[arg(long = "context-file", value_name = "FILE", global = true)]
     pub context_file: Option<PathBuf>,
@@ -199,6 +212,7 @@ pub struct ResolvedGoalCliOptions {
     pub goal: bool,
     pub fresh_resume: bool,
     pub status_file: Option<PathBuf>,
+    pub default_status_file: bool,
     pub context_file: Option<PathBuf>,
     pub handoff_dir: Option<PathBuf>,
     pub turns: usize,
@@ -238,12 +252,19 @@ impl GoalCliOptions {
         let carry = self.carry || (!repeat && self.next.is_some());
         let auto_recover = !self.no_auto_recover
             && (matches!(self.mode, Some(GoalMode::V5 | GoalMode::V6)) || self.retries.is_some());
+        let default_status_file = !self.no_status
+            && (self.status
+                || self.handoff_dir.is_some()
+                || auto_recover
+                || turns > 1
+                || matches!(self.mode, Some(GoalMode::V5 | GoalMode::V6)));
 
         Ok(ResolvedGoalCliOptions {
             mode: self.mode,
             goal,
             fresh_resume,
             status_file: self.status_file.clone(),
+            default_status_file,
             context_file: self.context_file.clone(),
             handoff_dir: self.handoff_dir.clone(),
             turns,

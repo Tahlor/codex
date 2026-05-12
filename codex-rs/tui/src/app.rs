@@ -608,10 +608,11 @@ impl App {
         cli_kv_overrides: Vec<(String, TomlValue)>,
         harness_overrides: ConfigOverrides,
         active_profile: Option<String>,
-        initial_prompt: Option<String>,
-        initial_prompt_parse_slash: bool,
+        mut initial_prompt: Option<String>,
+        mut initial_prompt_parse_slash: bool,
         initial_images: Vec<PathBuf>,
-        initial_goal_objective: Option<String>,
+        mut initial_goal_objective: Option<String>,
+        fresh_resume_startup: Option<crate::FreshResumeStartup>,
         session_selection: SessionSelection,
         feedback: codex_feedback::CodexFeedback,
         is_first_run: bool,
@@ -738,6 +739,39 @@ impl App {
         let (mut chat_widget, initial_started_thread) = match session_selection {
             SessionSelection::StartFresh | SessionSelection::Exit => {
                 let started = app_server.start_thread(&config).await?;
+                if let Some(startup) = fresh_resume_startup.as_ref() {
+                    match crate::prepare_fresh_resume_startup(
+                        &mut app_server,
+                        &config,
+                        state_db.as_ref(),
+                        &startup.target_session,
+                        &startup.options,
+                        started.session.thread_id,
+                        startup.extra_prompt.as_deref(),
+                    )
+                    .await
+                    {
+                        Ok((objective, startup_prompt)) => {
+                            initial_goal_objective = Some(objective);
+                            initial_prompt = Some(startup_prompt);
+                            initial_prompt_parse_slash = false;
+                        }
+                        Err(err) => {
+                            app_server
+                                .shutdown()
+                                .await
+                                .inspect_err(|shutdown_err| {
+                                    tracing::warn!(
+                                        "app-server shutdown failed after fresh resume error: {shutdown_err}"
+                                    );
+                                })
+                                .ok();
+                            return Ok(AppExitInfo::fatal(format!(
+                                "Failed to prepare fresh resume handoff: {err}"
+                            )));
+                        }
+                    }
+                }
                 if let Some(objective) = initial_goal_objective.as_deref() {
                     app_server
                         .thread_goal_set(

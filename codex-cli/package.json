@@ -5,7 +5,9 @@
   "bin": {
     "codexx": "bin/codex.js",
     "codex-v5": "bin/codex-v5.js",
-    "codex-v6": "bin/codex-v6.js"
+    "codex-v6": "bin/codex-v6.js",
+    "codexx-v5": "bin/codex-v5.js",
+    "codexx-v6": "bin/codex-v6.js"
   },
   "type": "module",
   "engines": {

@@ -21,7 +21,7 @@ Install globally with your preferred package manager:
 npm install -g codexx
 ```
 
-Then run `codexx` to get started. This fork also installs `codex-v5` and `codex-v6` aliases, and does not install a `codex` command.
+Then run `codexx` to get started. This fork also installs `codex-v5`, `codex-v6`, `codexx-v5`, and `codexx-v6` aliases, and does not install a `codex` command.
 
 <details>
 <summary>You can also go to the <a href="https://github.com/openai/codex/releases/latest">latest GitHub Release</a> and download the appropriate binary for your platform.</summary>

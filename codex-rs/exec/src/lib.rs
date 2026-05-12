@@ -207,6 +207,7 @@ impl RequestIdSequencer {
 
 #[derive(Clone, Debug, Default)]
 struct GoalHandoff {
+    thread_id: String,
     status_file: Option<PathBuf>,
     context_file: Option<PathBuf>,
 }
@@ -229,13 +230,17 @@ struct TurnRunOutcome {
     final_agent_message: Option<String>,
 }
 
-fn default_handoff_dir(config: &Config, options: &ResolvedGoalCliOptions) -> PathBuf {
+fn default_handoff_dir(
+    config: &Config,
+    options: &ResolvedGoalCliOptions,
+    thread_id: &str,
+) -> PathBuf {
     resolve_workspace_path(
         config.cwd.as_path(),
         options
             .handoff_dir
             .clone()
-            .unwrap_or_else(|| PathBuf::from(".codex").join("sessions").join("goal")),
+            .unwrap_or_else(|| PathBuf::from(".codexx").join("sessions").join(thread_id)),
     )
 }
 
@@ -258,25 +263,23 @@ fn ensure_file_with_default(path: &Path, contents: &str) -> anyhow::Result<()> {
 }
 
 fn should_create_default_status_file(options: &ResolvedGoalCliOptions) -> bool {
-    options.handoff_dir.is_some()
-        || options.auto_recover
-        || options.turns > 1
-        || matches!(options.mode, Some(GoalMode::V5 | GoalMode::V6))
+    options.default_status_file
 }
 
 fn should_create_default_context_file(
     options: &ResolvedGoalCliOptions,
     fresh_resume: Option<&FreshResumeSeed>,
 ) -> bool {
-    options.handoff_dir.is_some() || fresh_resume.is_some()
+    options.handoff_dir.is_some() || fresh_resume.is_some() || options.auto_recover
 }
 
 fn prepare_goal_handoff(
     config: &Config,
     options: &ResolvedGoalCliOptions,
     fresh_resume: Option<&FreshResumeSeed>,
+    thread_id: &str,
 ) -> anyhow::Result<GoalHandoff> {
-    let default_dir = default_handoff_dir(config, options);
+    let default_dir = default_handoff_dir(config, options, thread_id);
     let status_file = options
         .status_file
         .clone()
@@ -294,21 +297,22 @@ fn prepare_goal_handoff(
         .map(|path| resolve_workspace_path(config.cwd.as_path(), path));
 
     if let Some(path) = status_file.as_deref() {
-        ensure_file_with_default(path, "# Codex Status\n\n")?;
+        ensure_file_with_default(path, &format!("# Codex Status\n\nThread: {thread_id}\n\n"))?;
     }
     if let Some(path) = context_file.as_deref() {
         let contents = if let Some(seed) = fresh_resume {
             format!(
-                "# Codex Recovery Context\n\nSource thread: {}\n\nRecovered goal:\n{}\n",
+                "# Codex Recovery Context\n\nThread: {thread_id}\nSource thread: {}\n\nRecovered goal:\n{}\n",
                 seed.source_thread_id, seed.objective
             )
         } else {
-            "# Codex Recovery Context\n\n".to_string()
+            format!("# Codex Recovery Context\n\nThread: {thread_id}\n\n")
         };
         ensure_file_with_default(path, &contents)?;
     }
 
     Ok(GoalHandoff {
+        thread_id: thread_id.to_string(),
         status_file,
         context_file,
     })
@@ -333,6 +337,38 @@ fn prompt_with_handoff(prompt: &str, handoff: &GoalHandoff) -> String {
     } else {
         format!("{}\n\n{}", prompt, additions.join("\n"))
     }
+}
+
+fn write_latest_recovery_context(
+    handoff: &GoalHandoff,
+    objective: &str,
+    latest_status: &str,
+) -> anyhow::Result<()> {
+    let Some(path) = handoff.context_file.as_deref() else {
+        return Ok(());
+    };
+    if let Some(parent) = path.parent() {
+        std::fs::create_dir_all(parent)?;
+    }
+    let status_file = handoff
+        .status_file
+        .as_deref()
+        .map(|path| path.display().to_string())
+        .unwrap_or_else(|| "not configured".to_string());
+    let contents = format!(
+        "# Codex Recovery Context\n\n\
+Handoff thread: {}\n\n\
+Original objective:\n{}\n\n\
+Latest recovery context:\n{}\n\n\
+Status file: {}\n\n\
+This file is overwritten on each automatic recovery attempt so restarts use the latest bounded handoff, not an accumulated transcript.\n",
+        handoff.thread_id,
+        objective.trim(),
+        latest_status.trim(),
+        status_file
+    );
+    std::fs::write(path, contents)?;
+    Ok(())
 }
 
 async fn recover_fresh_resume_seed(
@@ -959,7 +995,74 @@ async fn run_exec_session(args: ExecRunArgs) -> anyhow::Result<()> {
         ),
         _ => None,
     };
-    let goal_handoff = prepare_goal_handoff(&config, &goal_options, fresh_resume_seed.as_ref())?;
+    // Handle resume subcommand through existing `thread/list` + `thread/resume`
+    // APIs so exec no longer reaches into rollout storage directly.
+    let (primary_thread_id, fallback_session_configured) = if let Some(ExecCommand::Resume(args)) =
+        command.as_ref().filter(|_| !goal_options.fresh_resume)
+    {
+        if let Some(thread_id) =
+            resolve_resume_thread_id(&client, &config, state_db.as_ref(), args).await?
+        {
+            let response: ThreadResumeResponse = send_request_with_response(
+                &mut client,
+                ClientRequest::ThreadResume {
+                    request_id: request_ids.next(),
+                    params: thread_resume_params_from_config(&config, thread_id),
+                },
+                "thread/resume",
+            )
+            .await
+            .map_err(anyhow::Error::msg)?;
+            let session_configured =
+                session_configured_from_thread_resume_response(&response, &config)
+                    .map_err(anyhow::Error::msg)?;
+            (session_configured.thread_id, session_configured)
+        } else {
+            let response: ThreadStartResponse = send_request_with_response(
+                &mut client,
+                ClientRequest::ThreadStart {
+                    request_id: request_ids.next(),
+                    params: thread_start_params_from_config(&config),
+                },
+                "thread/start",
+            )
+            .await
+            .map_err(anyhow::Error::msg)?;
+            let session_configured =
+                session_configured_from_thread_start_response(&response, &config)
+                    .map_err(anyhow::Error::msg)?;
+            (session_configured.thread_id, session_configured)
+        }
+    } else {
+        let response: ThreadStartResponse = send_request_with_response(
+            &client,
+            ClientRequest::ThreadStart {
+                request_id: request_ids.next(),
+                params: thread_start_params_from_config(&config),
+            },
+            "thread/start",
+        )
+        .await
+        .map_err(anyhow::Error::msg)?;
+        let session_configured = session_configured_from_thread_start_response(&response, &config)
+            .map_err(anyhow::Error::msg)?;
+        (session_configured.thread_id, session_configured)
+    };
+
+    let primary_thread_id_for_span = primary_thread_id.to_string();
+    // Use the start/resume response as the authoritative bootstrap payload.
+    // Waiting for a later streamed `SessionConfigured` event adds up to 10s of
+    // avoidable startup latency on the in-process path.
+    let session_configured = fallback_session_configured;
+
+    exec_span.record("thread.id", primary_thread_id_for_span.as_str());
+
+    let goal_handoff = prepare_goal_handoff(
+        &config,
+        &goal_options,
+        fresh_resume_seed.as_ref(),
+        primary_thread_id_for_span.as_str(),
+    )?;
 
     let (initial_operation, prompt_summary, followup_source_prompt, initial_goal_objective) =
         match (command.as_ref(), prompt, images) {
@@ -1070,68 +1173,6 @@ async fn run_exec_session(args: ExecRunArgs) -> anyhow::Result<()> {
             }
         };
 
-    // Handle resume subcommand through existing `thread/list` + `thread/resume`
-    // APIs so exec no longer reaches into rollout storage directly.
-    let (primary_thread_id, fallback_session_configured) = if let Some(ExecCommand::Resume(args)) =
-        command.as_ref().filter(|_| !goal_options.fresh_resume)
-    {
-        if let Some(thread_id) =
-            resolve_resume_thread_id(&client, &config, state_db.as_ref(), args).await?
-        {
-            let response: ThreadResumeResponse = send_request_with_response(
-                &mut client,
-                ClientRequest::ThreadResume {
-                    request_id: request_ids.next(),
-                    params: thread_resume_params_from_config(&config, thread_id),
-                },
-                "thread/resume",
-            )
-            .await
-            .map_err(anyhow::Error::msg)?;
-            let session_configured =
-                session_configured_from_thread_resume_response(&response, &config)
-                    .map_err(anyhow::Error::msg)?;
-            (session_configured.thread_id, session_configured)
-        } else {
-            let response: ThreadStartResponse = send_request_with_response(
-                &mut client,
-                ClientRequest::ThreadStart {
-                    request_id: request_ids.next(),
-                    params: thread_start_params_from_config(&config),
-                },
-                "thread/start",
-            )
-            .await
-            .map_err(anyhow::Error::msg)?;
-            let session_configured =
-                session_configured_from_thread_start_response(&response, &config)
-                    .map_err(anyhow::Error::msg)?;
-            (session_configured.thread_id, session_configured)
-        }
-    } else {
-        let response: ThreadStartResponse = send_request_with_response(
-            &client,
-            ClientRequest::ThreadStart {
-                request_id: request_ids.next(),
-                params: thread_start_params_from_config(&config),
-            },
-            "thread/start",
-        )
-        .await
-        .map_err(anyhow::Error::msg)?;
-        let session_configured = session_configured_from_thread_start_response(&response, &config)
-            .map_err(anyhow::Error::msg)?;
-        (session_configured.thread_id, session_configured)
-    };
-
-    let primary_thread_id_for_span = primary_thread_id.to_string();
-    // Use the start/resume response as the authoritative bootstrap payload.
-    // Waiting for a later streamed `SessionConfigured` event adds up to 10s of
-    // avoidable startup latency on the in-process path.
-    let session_configured = fallback_session_configured;
-
-    exec_span.record("thread.id", primary_thread_id_for_span.as_str());
-
     // Print the effective configuration and initial request so users can see what Codex
     // is using.
     event_processor.print_config_summary(&config, &prompt_summary, &session_configured);
@@ -1174,6 +1215,7 @@ async fn run_exec_session(args: ExecRunArgs) -> anyhow::Result<()> {
                     .as_deref()
                     .unwrap_or(prompt_summary.as_str()),
                 &goal_options,
+                &goal_handoff,
             )
             .await?
         }
@@ -1239,6 +1281,7 @@ async fn run_exec_session(args: ExecRunArgs) -> anyhow::Result<()> {
                 None,
                 &prompt_text,
                 &goal_options,
+                &goal_handoff,
             )
             .await?;
             if outcome.error_seen {
@@ -1275,6 +1318,7 @@ async fn start_user_turn_with_recovery(
     output_schema: Option<Value>,
     goal_objective: &str,
     goal_options: &ResolvedGoalCliOptions,
+    goal_handoff: &GoalHandoff,
 ) -> anyhow::Result<TurnRunOutcome> {
     let mut attempt = 0usize;
     loop {
@@ -1314,6 +1358,11 @@ async fn start_user_turn_with_recovery(
         );
         warn!("{message}");
         event_processor.process_warning(message);
+        let latest_status = outcome
+            .final_agent_message
+            .as_deref()
+            .unwrap_or("The previous turn failed before producing a final agent message.");
+        write_latest_recovery_context(goal_handoff, goal_objective, latest_status)?;
         let session_configured = start_new_thread(client, request_ids, config).await?;
         *thread_id = session_configured.thread_id.to_string();
         exec_span.record("thread.id", thread_id.as_str());

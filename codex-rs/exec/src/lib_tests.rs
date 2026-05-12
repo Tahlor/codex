@@ -453,16 +453,85 @@ async fn prepare_goal_handoff_defaults_status_for_goal_mode() {
     .resolve()
     .expect("goal options should resolve");
 
-    let handoff = prepare_goal_handoff(&config, &options, None).expect("prepare handoff");
+    let thread_id = "123e4567-e89b-12d3-a456-426614174000";
+    let handoff =
+        prepare_goal_handoff(&config, &options, None, thread_id).expect("prepare handoff");
+    let expected_status = cwd
+        .path()
+        .join(".codexx")
+        .join("sessions")
+        .join(thread_id)
+        .join("STATUS.md");
+    let expected_context = cwd
+        .path()
+        .join(".codexx")
+        .join("sessions")
+        .join(thread_id)
+        .join("RECOVERY_CONTEXT.md");
+
+    assert_eq!(handoff.status_file, Some(expected_status.clone()));
+    assert_eq!(handoff.context_file, Some(expected_context.clone()));
+    assert!(expected_status.exists());
+    assert!(expected_context.exists());
+    let status = std::fs::read_to_string(expected_status).expect("read status");
+    assert!(status.contains(&format!("Thread: {thread_id}")));
+    let context = std::fs::read_to_string(expected_context).expect("read context");
+    assert!(context.contains(&format!("Thread: {thread_id}")));
+}
+
+#[tokio::test]
+async fn prepare_goal_handoff_status_flag_uses_thread_scoped_default() {
+    let codex_home = tempdir().expect("create temp codex home");
+    let cwd = tempdir().expect("create temp cwd");
+    let config = ConfigBuilder::default()
+        .codex_home(codex_home.path().to_path_buf())
+        .fallback_cwd(Some(cwd.path().to_path_buf()))
+        .build()
+        .await
+        .expect("build config");
+    let options = crate::cli::GoalCliOptions {
+        status: true,
+        ..Default::default()
+    }
+    .resolve()
+    .expect("goal options should resolve");
+
+    let thread_id = "123e4567-e89b-12d3-a456-426614174000";
+    let handoff =
+        prepare_goal_handoff(&config, &options, None, thread_id).expect("prepare handoff");
     let expected_status = cwd
         .path()
         .join(".codex")
         .join("sessions")
-        .join("goal")
+        .join(thread_id)
         .join("STATUS.md");
 
     assert_eq!(handoff.status_file, Some(expected_status.clone()));
     assert!(expected_status.exists());
+}
+
+#[tokio::test]
+async fn latest_recovery_context_overwrites_previous_handoff() {
+    let dir = tempdir().expect("create temp dir");
+    let status = dir.path().join("STATUS.md");
+    let context = dir.path().join("RECOVERY_CONTEXT.md");
+    let handoff = GoalHandoff {
+        thread_id: "handoff-thread".to_string(),
+        status_file: Some(status.clone()),
+        context_file: Some(context.clone()),
+    };
+
+    write_latest_recovery_context(&handoff, "original goal", "first failure")
+        .expect("write first context");
+    write_latest_recovery_context(&handoff, "original goal", "second failure")
+        .expect("write second context");
+
+    let text = std::fs::read_to_string(context).expect("read context");
+    assert!(text.contains("Handoff thread: handoff-thread"));
+    assert!(text.contains("Original objective:\noriginal goal"));
+    assert!(text.contains("Latest recovery context:\nsecond failure"));
+    assert!(text.contains(&format!("Status file: {}", status.display())));
+    assert!(!text.contains("first failure"));
 }
 
 #[tokio::test]
@@ -482,7 +551,13 @@ async fn prepare_goal_handoff_handoff_dir_defaults_context() {
     .resolve()
     .expect("goal options should resolve");
 
-    let handoff = prepare_goal_handoff(&config, &options, None).expect("prepare handoff");
+    let handoff = prepare_goal_handoff(
+        &config,
+        &options,
+        None,
+        "123e4567-e89b-12d3-a456-426614174000",
+    )
+    .expect("prepare handoff");
     let expected_status = cwd.path().join("handoff").join("STATUS.md");
     let expected_context = cwd.path().join("handoff").join("RECOVERY_CONTEXT.md");
 

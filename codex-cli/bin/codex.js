@@ -184,10 +184,10 @@ function launcherModeArgs(userArgs) {
 
   const launcher = process.argv[1] || "";
   const launcherName = path.basename(launcher, path.extname(launcher));
-  if (launcherName === "codex-v5") {
+  if (launcherName === "codex-v5" || launcherName === "codexx-v5") {
     return ["--mode", "v5"];
   }
-  if (launcherName === "codex-v6") {
+  if (launcherName === "codex-v6" || launcherName === "codexx-v6") {
     return ["--mode", "v6"];
   }
   return [];

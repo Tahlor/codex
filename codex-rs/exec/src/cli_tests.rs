@@ -111,6 +111,23 @@ fn v6_mode_defaults_to_fresh_resume() {
     assert_eq!(resolved.mode, Some(GoalMode::V6));
     assert!(resolved.goal);
     assert!(resolved.fresh_resume);
+    assert!(resolved.default_status_file);
+}
+
+#[test]
+fn status_flag_enables_default_status_file_without_profile_mode() {
+    let cli = Cli::parse_from(["codex-exec", "--status", "ship"]);
+
+    let resolved = cli.goal.resolve().expect("goal options should resolve");
+    assert!(resolved.default_status_file);
+}
+
+#[test]
+fn no_status_suppresses_profile_default_status_file() {
+    let cli = Cli::parse_from(["codex-exec", "--mode", "v5", "--no-status", "ship"]);
+
+    let resolved = cli.goal.resolve().expect("goal options should resolve");
+    assert!(!resolved.default_status_file);
 }
 
 #[test]

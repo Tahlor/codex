@@ -6,7 +6,7 @@ RELEASE="latest"
 
 BIN_DIR="${CODEX_INSTALL_DIR:-$HOME/.local/bin}"
 PRIMARY_COMMAND="codexx"
-ALIAS_COMMANDS="codex-v5 codex-v6"
+ALIAS_COMMANDS="codex-v5 codex-v6 codexx-v5 codexx-v6"
 BIN_PATH="$BIN_DIR/$PRIMARY_COMMAND"
 CODEXX_HOME_DIR="${CODEXX_HOME:-$HOME/.codexx}"
 STANDALONE_ROOT="$CODEXX_HOME_DIR/packages/standalone"
@@ -627,6 +627,8 @@ release_dir_is_complete() {
     [ -x "$release_dir/$PRIMARY_COMMAND" ] &&
     [ -x "$release_dir/codex-v5" ] &&
     [ -x "$release_dir/codex-v6" ] &&
+    [ -x "$release_dir/codexx-v5" ] &&
+    [ -x "$release_dir/codexx-v6" ] &&
     [ -x "$release_dir/codex-resources/rg" ] &&
     [ "$(basename "$release_dir")" = "$expected_version-$expected_target" ] &&
     case "$expected_target" in
