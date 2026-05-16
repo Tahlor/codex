@@ -23,6 +23,10 @@ npm install -g codexx
 
 Then run `codexx` to get started. This fork also installs `codexxx`, `codex-v5`, `codex-v6`, `codex-v7`, `codexx-v5`, `codexx-v6`, and `codexx-v7` aliases, and does not install a `codex` command.
 
+For source installs and future OpenAI release merges, use one checkout of this
+repository. Do not use a wrapper repository with a nested `upstream` folder. See
+[Codexx single-repo workflow](./docs/codexx-single-repo-workflow.md).
+
 <details>
 <summary>You can also go to the <a href="https://github.com/openai/codex/releases/latest">latest GitHub Release</a> and download the appropriate binary for your platform.</summary>
 
@@ -50,6 +54,8 @@ You can also use Codex with an API key, but this requires [additional setup](htt
 - [**Codex Documentation**](https://developers.openai.com/codex)
 - [**Contributing**](./docs/contributing.md)
 - [**Installing & building**](./docs/install.md)
+- [**Codexx single-repo workflow**](./docs/codexx-single-repo-workflow.md)
+- [**Codexx release and merge notes**](./docs/codexx-release-and-merge.md)
 - [**Open source fund**](./docs/open-source-fund.md)
 
 This repository is licensed under the [Apache-2.0 License](LICENSE).

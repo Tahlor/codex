@@ -18,6 +18,10 @@ For a requirements-level inventory of the forked behavior and changed files,
 read the root-level
 [READ_THIS_CODEXX_CHANGE_REQUIREMENTS.md](../READ_THIS_CODEXX_CHANGE_REQUIREMENTS.md).
 
+For the local checkout layout, clone and work in one repository only. Do not use
+`codex-openai-fork` with a nested `upstream` folder. See
+[Codexx single-repo workflow](./codexx-single-repo-workflow.md).
+
 ## Precompiled Platforms
 
 The npm release staging path builds one meta package plus native payloads for:
@@ -71,13 +75,26 @@ dependencies such as `codexx-linux-x64 -> npm:codexx@0.130.0-linux-x64`.
 ## Merge Onto A New Upstream Release
 
 Keep the fork changes as a small branch on top of an upstream release tag. To
-forward-port:
+forward-port in the single Codexx repository, add OpenAI's repo as a remote
+named `openai`:
 
 ```powershell
-.\scripts\merge-codexx-release.ps1 -ReleaseTag rust-v0.131.0
+gitt remote add openai git@github.com:openai/codex.git
+gitt fetch openai --tags
 ```
 
-The helper fetches upstream tags, creates `codexx/rust-v0.131.0`, and
+Then run:
+
+```powershell
+.\scripts\merge-codexx-release.ps1 `
+  -ReleaseTag rust-v0.131.0 `
+  -UpstreamRemote openai `
+  -BaseTag rust-v0.130.0 `
+  -PatchRef codexx-goal-profiles-rust-v0.130.0 `
+  -WorkBranch codexx-goal-profiles-rust-v0.131.0
+```
+
+The helper fetches upstream tags, creates the requested work branch, and
 cherry-picks the Codexx patch range with `rerere` enabled and Git's
 renormalizing merge strategy. Resolve conflicts if any, then run:
 
