@@ -128,6 +128,15 @@ pub struct GoalCliOptions {
     #[arg(long = "fresh-resume", global = true, default_value_t = false)]
     pub fresh_resume: bool,
 
+    /// Put fresh-resume context in the first message and keep the goal objective clean.
+    #[arg(
+        long = "fresh-resume-context-in-first-message",
+        alias = "resume-context-in-first-message",
+        global = true,
+        default_value_t = false
+    )]
+    pub fresh_resume_context_in_first_message: bool,
+
     /// Status file to read, create, and keep current.
     #[arg(long = "status-file", value_name = "FILE", global = true)]
     pub status_file: Option<PathBuf>,
@@ -204,6 +213,7 @@ pub struct GoalCliOptions {
 pub enum GoalMode {
     V5,
     V6,
+    V7,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -211,6 +221,7 @@ pub struct ResolvedGoalCliOptions {
     pub mode: Option<GoalMode>,
     pub goal: bool,
     pub fresh_resume: bool,
+    pub fresh_resume_context_in_first_message: bool,
     pub status_file: Option<PathBuf>,
     pub default_status_file: bool,
     pub context_file: Option<PathBuf>,
@@ -233,9 +244,14 @@ impl GoalCliOptions {
             return Err("--first-goal and --last-goal cannot be used together".to_string());
         }
 
-        let profile_goal = matches!(self.mode, Some(GoalMode::V5 | GoalMode::V6));
-        let goal = (self.goal || profile_goal) && !self.no_goal;
-        let fresh_resume = self.fresh_resume || matches!(self.mode, Some(GoalMode::V6));
+        let profile_goal = matches!(self.mode, Some(GoalMode::V5 | GoalMode::V6 | GoalMode::V7));
+        let fresh_resume_context_in_first_message =
+            self.fresh_resume_context_in_first_message || matches!(self.mode, Some(GoalMode::V7));
+        let fresh_resume = (self.fresh_resume
+            || fresh_resume_context_in_first_message
+            || matches!(self.mode, Some(GoalMode::V6 | GoalMode::V7)))
+            && !self.no_goal;
+        let goal = (self.goal || profile_goal || fresh_resume) && !self.no_goal;
         let turns = self.turns.unwrap_or(1);
         if turns == 0 {
             return Err("--turns must be greater than 0".to_string());
@@ -251,18 +267,20 @@ impl GoalCliOptions {
         let repeat = self.repeat;
         let carry = self.carry || (!repeat && self.next.is_some());
         let auto_recover = !self.no_auto_recover
-            && (matches!(self.mode, Some(GoalMode::V5 | GoalMode::V6)) || self.retries.is_some());
+            && (matches!(self.mode, Some(GoalMode::V5 | GoalMode::V6 | GoalMode::V7))
+                || self.retries.is_some());
         let default_status_file = !self.no_status
             && (self.status
                 || self.handoff_dir.is_some()
                 || auto_recover
                 || turns > 1
-                || matches!(self.mode, Some(GoalMode::V5 | GoalMode::V6)));
+                || matches!(self.mode, Some(GoalMode::V5 | GoalMode::V6 | GoalMode::V7)));
 
         Ok(ResolvedGoalCliOptions {
             mode: self.mode,
             goal,
             fresh_resume,
+            fresh_resume_context_in_first_message,
             status_file: self.status_file.clone(),
             default_status_file,
             context_file: self.context_file.clone(),

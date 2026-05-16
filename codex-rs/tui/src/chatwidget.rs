@@ -83,7 +83,7 @@ use crate::terminal_title::set_terminal_title;
 use crate::text_formatting::proper_join;
 use crate::token_usage::TokenUsage;
 use crate::token_usage::TokenUsageInfo;
-use crate::version::CODEX_CLI_VERSION;
+use crate::version::CODEXX_CLI_VERSION_DISPLAY;
 use codex_app_server_protocol::AddCreditsNudgeCreditType;
 use codex_app_server_protocol::AddCreditsNudgeEmailStatus;
 use codex_app_server_protocol::AppInfo;
@@ -9885,7 +9885,7 @@ impl ChatWidget {
                 /*reasoning_effort*/ None,
                 /*show_fast_status*/ false,
                 config.cwd.to_path_buf(),
-                CODEX_CLI_VERSION,
+                CODEXX_CLI_VERSION_DISPLAY,
             )
             .with_yolo_mode(history_cell::is_yolo_mode(config)),
         )
@@ -9948,7 +9948,7 @@ impl ChatWidget {
 
     fn rename_confirmation_cell(name: &str, thread_id: Option<ThreadId>) -> PlainHistoryCell {
         let resume_cmd = crate::legacy_core::util::resume_command(Some(name), thread_id)
-            .unwrap_or_else(|| format!("codexx resume {name}"));
+            .unwrap_or_else(|| format!("codex resume {name}"));
         let name = name.to_string();
         let line = vec![
             "• ".into(),

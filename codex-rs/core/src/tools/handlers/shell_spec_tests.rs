@@ -13,16 +13,16 @@ fn shell_tool_matches_expected_spec() {
     });
 
     let description = if cfg!(windows) {
-        r#"Runs a Powershell command (Windows) and returns its output. Arguments to `shell` will be passed to CreateProcessW(). Most commands should be prefixed with ["powershell.exe", "-Command"].
+        r#"Runs a Powershell command (Windows) and returns its output. Arguments to `shell` will be passed to CreateProcessW(). Most commands should be prefixed with ["powershell.exe", "-NoProfile", "-Command"].
 
 Examples of valid command strings:
 
-- ls -a (show hidden): ["powershell.exe", "-Command", "Get-ChildItem -Force"]
-- recursive find by name: ["powershell.exe", "-Command", "Get-ChildItem -Recurse -Filter *.py"]
-- recursive grep: ["powershell.exe", "-Command", "Get-ChildItem -Path C:\\myrepo -Recurse | Select-String -Pattern 'TODO' -CaseSensitive"]
-- ps aux | grep python: ["powershell.exe", "-Command", "Get-Process | Where-Object { $_.ProcessName -like '*python*' }"]
-- setting an env var: ["powershell.exe", "-Command", "$env:FOO='bar'; echo $env:FOO"]
-- running an inline Python script: ["powershell.exe", "-Command", "@'\\nprint('Hello, world!')\\n'@ | python -"]"#
+- ls -a (show hidden): ["powershell.exe", "-NoProfile", "-Command", "Get-ChildItem -Force"]
+- recursive find by name: ["powershell.exe", "-NoProfile", "-Command", "Get-ChildItem -Recurse -Filter *.py"]
+- recursive grep: ["powershell.exe", "-NoProfile", "-Command", "Get-ChildItem -Path C:\\myrepo -Recurse | Select-String -Pattern 'TODO' -CaseSensitive"]
+- ps aux | grep python: ["powershell.exe", "-NoProfile", "-Command", "Get-Process | Where-Object { $_.ProcessName -like '*python*' }"]
+- setting an env var: ["powershell.exe", "-NoProfile", "-Command", "$env:FOO='bar'; echo $env:FOO"]
+- running an inline Python script: ["powershell.exe", "-NoProfile", "-Command", "@'\\nprint('Hello, world!')\\n'@ | python -"]"#
             .to_string()
             + &windows_shell_guidance_description()
     } else {
@@ -149,7 +149,8 @@ fn exec_command_tool_matches_expected_spec() {
         (
             "login".to_string(),
             JsonSchema::boolean(Some(
-                    "Whether to run the shell with -l/-i semantics. Defaults to true.".to_string(),
+                    "Whether to run the shell with -l/-i semantics. Defaults to true. PowerShell invocations always use -NoProfile."
+                        .to_string(),
                 )),
         ),
     ]);
@@ -257,16 +258,16 @@ fn shell_tool_with_request_permission_includes_additional_permissions() {
 
     let description = if cfg!(windows) {
         format!(
-            r#"Runs a Powershell command (Windows) and returns its output. Arguments to `shell` will be passed to CreateProcessW(). Most commands should be prefixed with ["powershell.exe", "-Command"].
+            r#"Runs a Powershell command (Windows) and returns its output. Arguments to `shell` will be passed to CreateProcessW(). Most commands should be prefixed with ["powershell.exe", "-NoProfile", "-Command"].
 
 Examples of valid command strings:
 
-- ls -a (show hidden): ["powershell.exe", "-Command", "Get-ChildItem -Force"]
-- recursive find by name: ["powershell.exe", "-Command", "Get-ChildItem -Recurse -Filter *.py"]
-- recursive grep: ["powershell.exe", "-Command", "Get-ChildItem -Path C:\\myrepo -Recurse | Select-String -Pattern 'TODO' -CaseSensitive"]
-- ps aux | grep python: ["powershell.exe", "-Command", "Get-Process | Where-Object {{ $_.ProcessName -like '*python*' }}"]
-- setting an env var: ["powershell.exe", "-Command", "$env:FOO='bar'; echo $env:FOO"]
-- running an inline Python script: ["powershell.exe", "-Command", "@'\\nprint('Hello, world!')\\n'@ | python -"]
+- ls -a (show hidden): ["powershell.exe", "-NoProfile", "-Command", "Get-ChildItem -Force"]
+- recursive find by name: ["powershell.exe", "-NoProfile", "-Command", "Get-ChildItem -Recurse -Filter *.py"]
+- recursive grep: ["powershell.exe", "-NoProfile", "-Command", "Get-ChildItem -Path C:\\myrepo -Recurse | Select-String -Pattern 'TODO' -CaseSensitive"]
+- ps aux | grep python: ["powershell.exe", "-NoProfile", "-Command", "Get-Process | Where-Object {{ $_.ProcessName -like '*python*' }}"]
+- setting an env var: ["powershell.exe", "-NoProfile", "-Command", "$env:FOO='bar'; echo $env:FOO"]
+- running an inline Python script: ["powershell.exe", "-NoProfile", "-Command", "@'\\nprint('Hello, world!')\\n'@ | python -"]
 
 {}"#,
             windows_shell_guidance()
@@ -375,7 +376,7 @@ Examples of valid command strings:
         (
             "login".to_string(),
             JsonSchema::boolean(Some(
-                "Whether to run the shell with login shell semantics. Defaults to true."
+                "Whether to run the shell with login shell semantics. Defaults to true. PowerShell invocations always use -NoProfile."
                     .to_string(),
             )),
         ),

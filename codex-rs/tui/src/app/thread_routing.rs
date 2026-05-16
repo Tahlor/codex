@@ -7,7 +7,131 @@
 use super::*;
 use crate::session_resume::read_session_model;
 
+const AUTO_FRESH_RESTART_ERROR_STREAK_THRESHOLD: usize = 3;
+const REMOTE_COMPACT_ERROR_PREFIX: &str = "Error running remote compact task";
+
 impl App {
+    pub(super) fn repeated_error_recovery_key(message: &str) -> String {
+        let trimmed = message.trim();
+        if trimmed.contains(REMOTE_COMPACT_ERROR_PREFIX) {
+            REMOTE_COMPACT_ERROR_PREFIX.to_string()
+        } else if trimmed.contains("You've hit your usage limit") {
+            "You've hit your usage limit".to_string()
+        } else {
+            trimmed.to_string()
+        }
+    }
+
+    pub(super) fn immediate_auto_fresh_restart_error(
+        notification: &codex_app_server_protocol::ErrorNotification,
+    ) -> bool {
+        if notification.will_retry {
+            return false;
+        }
+
+        let message = notification.error.message.trim();
+        message.contains(REMOTE_COMPACT_ERROR_PREFIX)
+            || matches!(
+                notification.error.codex_error_info.as_ref(),
+                Some(AppServerCodexErrorInfo::ContextWindowExceeded)
+            )
+    }
+
+    fn note_auto_fresh_restart_error(&mut self, key: String) -> usize {
+        match self.auto_fresh_restart_error_streak.as_mut() {
+            Some(streak) if streak.key == key => {
+                streak.count += 1;
+                streak.count
+            }
+            _ => {
+                self.auto_fresh_restart_error_streak = Some(RepeatedErrorStreak { key, count: 1 });
+                1
+            }
+        }
+    }
+
+    fn reset_auto_fresh_restart_error_streak(&mut self) {
+        self.auto_fresh_restart_error_streak = None;
+    }
+
+    fn thread_buffered_event_thread_id(event: &ThreadBufferedEvent) -> Option<ThreadId> {
+        match event {
+            ThreadBufferedEvent::Notification(notification) => {
+                match super::app_server_event_targets::server_notification_thread_target(
+                    notification,
+                ) {
+                    super::app_server_event_targets::ServerNotificationThreadTarget::Thread(
+                        thread_id,
+                    ) => Some(thread_id),
+                    super::app_server_event_targets::ServerNotificationThreadTarget::InvalidThreadId(
+                        _,
+                    )
+                    | super::app_server_event_targets::ServerNotificationThreadTarget::Global => {
+                        None
+                    }
+                }
+            }
+            ThreadBufferedEvent::Request(request) => {
+                super::app_server_event_targets::server_request_thread_id(request)
+            }
+            ThreadBufferedEvent::HistoryEntryResponse(_) | ThreadBufferedEvent::FeedbackSubmission(_) => None,
+        }
+    }
+
+    pub(super) fn auto_fresh_restart_repeated_error_source(
+        &mut self,
+        event: &ThreadBufferedEvent,
+    ) -> Option<(ThreadId, String)> {
+        if !self.auto_fresh_restart_on_repeated_errors
+            || self.auto_fresh_restart_on_repeated_errors_used
+        {
+            return None;
+        }
+
+        let primary_thread_id = self.primary_thread_id?;
+        if self.active_thread_id != Some(primary_thread_id) {
+            return None;
+        }
+
+        match event {
+            ThreadBufferedEvent::Notification(ServerNotification::Error(notification)) => {
+                let thread_id = ThreadId::from_string(&notification.thread_id).ok()?;
+                if thread_id != primary_thread_id {
+                    return None;
+                }
+                let message = notification.error.message.trim().to_string();
+                let key = Self::repeated_error_recovery_key(&message);
+                if key.is_empty() {
+                    return None;
+                }
+                if Self::immediate_auto_fresh_restart_error(notification) {
+                    self.reset_auto_fresh_restart_error_streak();
+                    return Some((thread_id, message));
+                }
+                let count = self.note_auto_fresh_restart_error(key);
+                (count >= AUTO_FRESH_RESTART_ERROR_STREAK_THRESHOLD).then_some((thread_id, message))
+            }
+            ThreadBufferedEvent::Notification(ServerNotification::TurnCompleted(notification)) => {
+                let thread_id = ThreadId::from_string(&notification.thread_id).ok()?;
+                if thread_id == primary_thread_id
+                    && matches!(
+                        notification.turn.status,
+                        TurnStatus::Completed | TurnStatus::Interrupted
+                    )
+                {
+                    self.reset_auto_fresh_restart_error_streak();
+                }
+                None
+            }
+            _ => {
+                if Self::thread_buffered_event_thread_id(event) == Some(primary_thread_id) {
+                    self.reset_auto_fresh_restart_error_streak();
+                }
+                None
+            }
+        }
+    }
+
     pub(super) async fn shutdown_current_thread(&mut self, app_server: &mut AppServerSession) {
         if let Some(thread_id) = self.chat_widget.thread_id() {
             // Clear any in-flight rollback guard when switching threads.
@@ -1472,7 +1596,18 @@ impl App {
                 .await;
         }
 
+        let repeated_error_restart = self.auto_fresh_restart_repeated_error_source(&event);
         self.handle_thread_event_now(event);
+        if let Some((source_thread_id, error_message)) = repeated_error_restart {
+            self.auto_fresh_restart_on_repeated_errors_used = true;
+            self.start_fresh_session_from_repeated_error_recovery(
+                tui,
+                app_server,
+                source_thread_id,
+                error_message,
+            )
+            .await;
+        }
         if self.backtrack_render_pending {
             tui.frame_requester().schedule_frame();
         }

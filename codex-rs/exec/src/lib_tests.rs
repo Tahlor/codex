@@ -404,6 +404,14 @@ fn should_stop_after_turn_requires_stop_token_in_final_message() {
     assert!(should_stop_after_turn(&outcome, &options));
 }
 
+#[test]
+fn previous_session_before_restart_message_includes_resume_command() {
+    assert_eq!(
+        previous_session_before_restart_message("123e4567-e89b-12d3-a456-426614174000"),
+        "Previous session before fresh restart: codex resume 123e4567-e89b-12d3-a456-426614174000"
+    );
+}
+
 #[tokio::test]
 async fn goal_objective_from_rollout_path_picks_first_and_last_goal() {
     let dir = tempdir().expect("create tempdir");
@@ -418,6 +426,53 @@ async fn goal_objective_from_rollout_path_picks_first_and_last_goal() {
             "{}\n{}\n",
             serde_json::to_string(&first).expect("serialize first goal"),
             serde_json::to_string(&last).expect("serialize last goal")
+        ),
+    )
+    .expect("write rollout");
+
+    assert_eq!(
+        goal_objective_from_rollout_path(&path, HistoricalGoalPick::First)
+            .await
+            .expect("read first goal"),
+        Some("first useful goal".to_string())
+    );
+    assert_eq!(
+        goal_objective_from_rollout_path(&path, HistoricalGoalPick::Last)
+            .await
+            .expect("read last goal"),
+        Some("last useful goal".to_string())
+    );
+}
+
+#[tokio::test]
+async fn goal_objective_from_rollout_path_skips_generated_scaffolds() {
+    let dir = tempdir().expect("create tempdir");
+    let path = dir.path().join("rollout.jsonl");
+    let thread_id =
+        ThreadId::from_string("00000000-0000-0000-0000-000000000001").expect("valid thread id");
+    let generic = rollout_line_for_goal(
+        thread_id.clone(),
+        "Continue the active goal and ship the next useful improvement.",
+    );
+    let first = rollout_line_for_goal(thread_id.clone(), "first useful goal");
+    let short_reference = rollout_line_for_goal(
+        thread_id.clone(),
+        "Resume what you were doing in Codex session 123e4567-e89b-12d3-a456-426614174000.",
+    );
+    let recovered = rollout_line_for_goal(
+        thread_id,
+        "Continue the recovered goal from Codex session 123e4567-e89b-12d3-a456-426614174000.\n\n\
+Recovered goal:\nlast useful goal\n\n\
+Read the bounded context at `.codex/sessions/continuation/RECOVERY_CONTEXT.md` before continuing.",
+    );
+    std::fs::write(
+        &path,
+        format!(
+            "{}\n{}\n{}\n{}\n",
+            serde_json::to_string(&generic).expect("serialize generic goal"),
+            serde_json::to_string(&first).expect("serialize first goal"),
+            serde_json::to_string(&short_reference).expect("serialize short reference"),
+            serde_json::to_string(&recovered).expect("serialize recovered goal")
         ),
     )
     .expect("write rollout");
@@ -458,13 +513,13 @@ async fn prepare_goal_handoff_defaults_status_for_goal_mode() {
         prepare_goal_handoff(&config, &options, None, thread_id).expect("prepare handoff");
     let expected_status = cwd
         .path()
-        .join(".codexx")
+        .join(".codex")
         .join("sessions")
         .join(thread_id)
         .join("STATUS.md");
     let expected_context = cwd
         .path()
-        .join(".codexx")
+        .join(".codex")
         .join("sessions")
         .join(thread_id)
         .join("RECOVERY_CONTEXT.md");
@@ -508,6 +563,88 @@ async fn prepare_goal_handoff_status_flag_uses_thread_scoped_default() {
 
     assert_eq!(handoff.status_file, Some(expected_status.clone()));
     assert!(expected_status.exists());
+}
+
+#[test]
+fn fresh_resume_goal_objective_is_bounded_and_points_to_context() {
+    let seed = FreshResumeSeed {
+        source_thread_id: "123e4567-e89b-12d3-a456-426614174000".to_string(),
+        objective: "ship the fix".to_string(),
+    };
+    let handoff = GoalHandoff {
+        thread_id: "223e4567-e89b-12d3-a456-426614174001".to_string(),
+        status_file: Some(PathBuf::from(".codex/sessions/continuation/STATUS.md")),
+        context_file: Some(PathBuf::from(
+            ".codex/sessions/continuation/RECOVERY_CONTEXT.md",
+        )),
+    };
+
+    let objective = bounded_fresh_resume_goal_objective(&seed, &handoff);
+
+    assert!(objective.contains("Recovered goal:\nship the fix"));
+    assert!(objective.contains(".codex/sessions/continuation/RECOVERY_CONTEXT.md"));
+    assert!(char_count(&objective) <= MAX_THREAD_GOAL_OBJECTIVE_CHARS);
+}
+
+#[test]
+fn recovered_fresh_resume_goal_objective_omits_handoff_context() {
+    let seed = FreshResumeSeed {
+        source_thread_id: "123e4567-e89b-12d3-a456-426614174000".to_string(),
+        objective: "ship the fix".to_string(),
+    };
+
+    let objective = recovered_fresh_resume_goal_objective(&seed);
+
+    assert_eq!(objective, "ship the fix");
+    assert!(!objective.contains("RECOVERY_CONTEXT.md"));
+}
+
+#[test]
+fn recovered_fresh_resume_goal_objective_falls_back_when_too_long() {
+    let seed = FreshResumeSeed {
+        source_thread_id: "123e4567-e89b-12d3-a456-426614174000".to_string(),
+        objective: "x".repeat(MAX_THREAD_GOAL_OBJECTIVE_CHARS + 1),
+    };
+
+    let objective = recovered_fresh_resume_goal_objective(&seed);
+
+    assert_eq!(
+        objective,
+        "Resume what you were doing in Codex session 123e4567-e89b-12d3-a456-426614174000."
+    );
+}
+
+#[test]
+fn acknowledge_fresh_resume_prompt_requests_acknowledge() {
+    let prompt = acknowledge_fresh_resume_prompt(
+        "Continue the recovered goal.\n\nRead the bounded recovery context.".to_string(),
+    );
+
+    assert!(prompt.contains("Continue the recovered goal."));
+    assert!(prompt.contains("reply exactly with `acknowledge`"));
+}
+
+#[test]
+fn fresh_resume_goal_objective_uses_short_fallback_when_recovered_goal_is_too_long() {
+    let seed = FreshResumeSeed {
+        source_thread_id: "123e4567-e89b-12d3-a456-426614174000".to_string(),
+        objective: "x".repeat(MAX_THREAD_GOAL_OBJECTIVE_CHARS),
+    };
+    let handoff = GoalHandoff {
+        thread_id: "223e4567-e89b-12d3-a456-426614174001".to_string(),
+        status_file: Some(PathBuf::from(".codex/sessions/continuation/STATUS.md")),
+        context_file: Some(PathBuf::from(
+            ".codex/sessions/continuation/RECOVERY_CONTEXT.md",
+        )),
+    };
+
+    let objective = bounded_fresh_resume_goal_objective(&seed, &handoff);
+
+    assert!(objective.starts_with(
+        "Resume what you were doing in Codex session 123e4567-e89b-12d3-a456-426614174000."
+    ));
+    assert!(!objective.contains(&"x".repeat(80)));
+    assert!(char_count(&objective) <= MAX_THREAD_GOAL_OBJECTIVE_CHARS);
 }
 
 #[tokio::test]

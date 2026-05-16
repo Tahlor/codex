@@ -7,6 +7,7 @@ use super::*;
 use crate::bottom_pane::status_line_from_segments;
 use crate::branch_summary;
 use crate::status::format_tokens_compact;
+use crate::version::CODEX_CLI_VERSION;
 
 /// Items shown in the terminal title when the user has not configured a
 /// custom selection. Intentionally minimal: activity indicator + project name.

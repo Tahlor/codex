@@ -52,10 +52,10 @@ impl Shell {
             }
             ShellType::PowerShell => {
                 let mut args = vec![self.shell_path.to_string_lossy().to_string()];
-                if !use_login_shell {
-                    args.push("-NoProfile".to_string());
-                }
-
+                // PowerShell has no POSIX-style login shell here; loading user
+                // profiles can break sandboxed resumed sessions when profile
+                // startup code probes paths outside the active permission set.
+                args.push("-NoProfile".to_string());
                 args.push("-Command".to_string());
                 args.push(command.to_string());
                 args
@@ -399,6 +399,24 @@ mod detect_shell_type_tests {
         assert_eq!(
             detect_shell_type(&PathBuf::from("cmd.exe")),
             Some(ShellType::Cmd)
+        );
+    }
+
+    #[test]
+    fn powershell_derive_exec_args_always_disables_profiles() {
+        let shell = Shell {
+            shell_type: ShellType::PowerShell,
+            shell_path: PathBuf::from("pwsh.exe"),
+            shell_snapshot: empty_shell_snapshot_receiver(),
+        };
+
+        assert_eq!(
+            shell.derive_exec_args("echo hello", /*use_login_shell*/ false),
+            vec!["pwsh.exe", "-NoProfile", "-Command", "echo hello"]
+        );
+        assert_eq!(
+            shell.derive_exec_args("echo hello", /*use_login_shell*/ true),
+            vec!["pwsh.exe", "-NoProfile", "-Command", "echo hello"]
         );
     }
 }

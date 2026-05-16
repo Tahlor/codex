@@ -74,7 +74,7 @@ use crate::transcript_reflow::TranscriptReflowState;
 use crate::tui;
 use crate::tui::TuiEvent;
 use crate::update_action::UpdateAction;
-use crate::version::CODEX_CLI_VERSION;
+use crate::version::CODEXX_CLI_VERSION_DISPLAY;
 use crate::workspace_command::AppServerWorkspaceCommandRunner;
 use crate::workspace_command::WorkspaceCommandRunner;
 use codex_ansi_escape::ansi_escape_line;
@@ -386,6 +386,24 @@ fn session_summary(
     })
 }
 
+fn previous_session_before_restart_message(thread_id: ThreadId) -> String {
+    let resume_command = crate::legacy_core::util::resume_command(
+        /*thread_name*/ None,
+        Some(thread_id.clone()),
+    )
+    .unwrap_or_else(|| format!("codex resume {thread_id}"));
+    format!("Previous session before fresh restart: {resume_command}")
+}
+
+async fn print_previous_session_before_restart(tui: &mut tui::Tui, thread_id: ThreadId) {
+    let message = previous_session_before_restart_message(thread_id);
+    tracing::warn!("{message}");
+    tui.with_restored(tui::RestoreMode::Full, move || async move {
+        eprintln!("{message}");
+    })
+    .await;
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 struct ResumableThread {
     thread_id: ThreadId,
@@ -422,6 +440,12 @@ fn errors_for_cwd(cwd: &Path, response: &SkillsListResponse) -> Vec<SkillErrorIn
 struct SessionSummary {
     usage_line: Option<String>,
     resume_command: Option<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct RepeatedErrorStreak {
+    key: String,
+    count: usize,
 }
 
 #[derive(Debug, Default)]
@@ -502,6 +526,9 @@ pub(crate) struct App {
     primary_thread_id: Option<ThreadId>,
     last_subagent_backfill_attempt: Option<ThreadId>,
     primary_session_configured: Option<ThreadSessionState>,
+    auto_fresh_restart_on_repeated_errors: bool,
+    auto_fresh_restart_on_repeated_errors_used: bool,
+    auto_fresh_restart_error_streak: Option<RepeatedErrorStreak>,
     pending_primary_events: VecDeque<ThreadBufferedEvent>,
     pending_app_server_requests: PendingAppServerRequests,
     // Serialize plugin enablement writes per plugin so stale completions cannot
@@ -613,6 +640,7 @@ impl App {
         initial_images: Vec<PathBuf>,
         mut initial_goal_objective: Option<String>,
         fresh_resume_startup: Option<crate::FreshResumeStartup>,
+        auto_fresh_restart_on_repeated_errors: bool,
         session_selection: SessionSelection,
         feedback: codex_feedback::CodexFeedback,
         is_first_run: bool,
@@ -738,6 +766,13 @@ impl App {
             );
         let (mut chat_widget, initial_started_thread) = match session_selection {
             SessionSelection::StartFresh | SessionSelection::Exit => {
+                if let Some(startup) = fresh_resume_startup.as_ref() {
+                    print_previous_session_before_restart(
+                        tui,
+                        startup.target_session.thread_id.clone(),
+                    )
+                    .await;
+                }
                 let started = app_server.start_thread(&config).await?;
                 if let Some(startup) = fresh_resume_startup.as_ref() {
                     match crate::prepare_fresh_resume_startup(
@@ -956,6 +991,9 @@ See the Codex keymap documentation for supported actions and examples."
             primary_thread_id: None,
             last_subagent_backfill_attempt: None,
             primary_session_configured: None,
+            auto_fresh_restart_on_repeated_errors,
+            auto_fresh_restart_on_repeated_errors_used: false,
+            auto_fresh_restart_error_streak: None,
             pending_primary_events: VecDeque::new(),
             pending_app_server_requests: PendingAppServerRequests::default(),
             pending_plugin_enabled_writes: HashMap::new(),

@@ -37,6 +37,7 @@ use codex_tui::FreshResumeCliOptions;
 use codex_tui::UpdateAction;
 use codex_utils_absolute_path::AbsolutePathBuf;
 use codex_utils_cli::CliConfigOverrides;
+use codex_utils_cli::SharedCliOptions;
 use owo_colors::OwoColorize;
 use std::io::IsTerminal;
 use std::path::PathBuf;
@@ -74,9 +75,15 @@ use codex_terminal_detection::TerminalName;
 ///
 /// If no subcommand is specified, options will be forwarded to the interactive CLI.
 #[derive(Debug, Parser)]
-#[clap(
+#[command(
     author,
-    version,
+    name = "codexx",
+    version = concat!(
+        env!("CARGO_PKG_VERSION"),
+        "-codexx-local.20260515.3 (upstream codex-cli ",
+        env!("CARGO_PKG_VERSION"),
+        ")"
+    ),
     // If a sub‑command is given, ignore requirements of the default args.
     subcommand_negates_reqs = true,
     // The executable is sometimes invoked via a platform-specific name, but
@@ -762,6 +769,7 @@ fn goal_mode_for_exe_name(exe_name: &str) -> Option<GoalMode> {
     match exe_name {
         "codex-v5" | "codexx-v5" => Some(GoalMode::V5),
         "codex-v6" | "codexx-v6" => Some(GoalMode::V6),
+        "codex-v7" | "codexx-v7" => Some(GoalMode::V7),
         _ => None,
     }
 }
@@ -784,6 +792,7 @@ fn root_goal_options_applies_to_exec(options: &GoalCliOptions) -> bool {
     !options.no_goal
         && (options.goal
             || options.fresh_resume
+            || options.fresh_resume_context_in_first_message
             || options.status
             || options.status_file.is_some()
             || options.context_file.is_some()
@@ -801,7 +810,10 @@ fn root_goal_options_applies_to_exec(options: &GoalCliOptions) -> bool {
 }
 
 fn root_goal_mode_applies_to_interactive(options: &GoalCliOptions) -> bool {
-    matches!(options.mode, Some(GoalMode::V5 | GoalMode::V6)) && !options.no_goal
+    matches!(
+        options.mode,
+        Some(GoalMode::V5 | GoalMode::V6 | GoalMode::V7)
+    ) && !options.no_goal
 }
 
 fn goal_feature_already_overridden(overrides: &CliConfigOverrides) -> bool {
@@ -843,10 +855,28 @@ fn apply_interactive_goal_mode_defaults(
         return false;
     }
 
-    if let Some(prompt) = interactive.prompt.take() {
-        interactive.prompt = Some(prompt_as_goal_slash_command(prompt));
-        interactive.initial_prompt_parse_slash = true;
+    let Some(prompt) = interactive.prompt.take() else {
+        return false;
+    };
+
+    interactive.prompt = Some(prompt_as_goal_slash_command(prompt));
+    interactive.initial_prompt_parse_slash = true;
+    true
+}
+
+fn apply_interactive_goal_mode_error_recovery_default(
+    interactive: &mut TuiCli,
+    root_goal_options: &GoalCliOptions,
+) -> bool {
+    if !matches!(
+        root_goal_options.mode,
+        Some(GoalMode::V5 | GoalMode::V6 | GoalMode::V7)
+    ) || root_goal_options.no_goal
+    {
+        return false;
     }
+
+    interactive.auto_fresh_restart_on_repeated_errors = true;
     true
 }
 
@@ -869,7 +899,8 @@ fn fresh_resume_options_from_goal_options(
         status_file: resolved.status_file,
         context_file: resolved.context_file,
         handoff_dir: resolved.handoff_dir,
-        v6_profile: matches!(resolved.mode, Some(GoalMode::V6)),
+        v6_profile: matches!(resolved.mode, Some(GoalMode::V6 | GoalMode::V7)),
+        context_in_first_message: resolved.fresh_resume_context_in_first_message,
     }))
 }
 
@@ -880,6 +911,7 @@ fn inherit_goal_options(target: &mut GoalCliOptions, root: &GoalCliOptions) {
     target.goal |= root.goal;
     target.no_goal |= root.no_goal;
     target.fresh_resume |= root.fresh_resume;
+    target.fresh_resume_context_in_first_message |= root.fresh_resume_context_in_first_message;
     target.status |= root.status;
     target.no_status |= root.no_status;
     if target.status_file.is_none() {
@@ -909,6 +941,49 @@ fn inherit_goal_options(target: &mut GoalCliOptions, root: &GoalCliOptions) {
     target.first_goal |= root.first_goal;
     target.last_goal |= root.last_goal;
     target.no_auto_recover |= root.no_auto_recover;
+}
+
+fn goal_mode_defaults_to_yolo(options: &GoalCliOptions) -> bool {
+    matches!(
+        options.mode,
+        Some(GoalMode::V5 | GoalMode::V6 | GoalMode::V7)
+    )
+}
+
+fn apply_goal_mode_yolo_default(
+    shared: &mut SharedCliOptions,
+    goal_options: &GoalCliOptions,
+    approval_policy_explicit: bool,
+) -> bool {
+    if !goal_mode_defaults_to_yolo(goal_options)
+        || approval_policy_explicit
+        || shared.sandbox_mode.is_some()
+        || shared.dangerously_bypass_approvals_and_sandbox
+    {
+        return false;
+    }
+
+    shared.dangerously_bypass_approvals_and_sandbox = true;
+    true
+}
+
+fn apply_interactive_goal_mode_yolo_default(
+    interactive: &mut TuiCli,
+    goal_options: &GoalCliOptions,
+) -> bool {
+    apply_goal_mode_yolo_default(
+        &mut interactive.shared,
+        goal_options,
+        interactive.approval_policy.is_some(),
+    )
+}
+
+fn apply_exec_goal_mode_yolo_default(
+    exec_cli: &mut ExecCli,
+    goal_options: &GoalCliOptions,
+    approval_policy_explicit: bool,
+) -> bool {
+    apply_goal_mode_yolo_default(&mut exec_cli.shared, goal_options, approval_policy_explicit)
 }
 
 async fn cli_main(arg0_paths: Arg0DispatchPaths) -> anyhow::Result<()> {
@@ -943,6 +1018,11 @@ async fn cli_main(arg0_paths: Arg0DispatchPaths) -> anyhow::Result<()> {
                 exec_cli
                     .shared
                     .inherit_exec_root_options(&interactive.shared);
+                apply_exec_goal_mode_yolo_default(
+                    &mut exec_cli,
+                    &root_goal_options,
+                    interactive.approval_policy.is_some(),
+                );
                 prepend_config_flags(
                     &mut exec_cli.config_overrides,
                     root_config_overrides.clone(),
@@ -950,6 +1030,11 @@ async fn cli_main(arg0_paths: Arg0DispatchPaths) -> anyhow::Result<()> {
                 codex_exec::run_main(exec_cli, arg0_paths.clone()).await?;
                 return Ok(());
             }
+            apply_interactive_goal_mode_yolo_default(&mut interactive, &root_goal_options);
+            apply_interactive_goal_mode_error_recovery_default(
+                &mut interactive,
+                &root_goal_options,
+            );
             if apply_interactive_goal_mode_defaults(&mut interactive, &root_goal_options) {
                 enable_goals_feature_by_default(&mut root_config_overrides);
             }
@@ -976,6 +1061,12 @@ async fn cli_main(arg0_paths: Arg0DispatchPaths) -> anyhow::Result<()> {
                 .shared
                 .inherit_exec_root_options(&interactive.shared);
             inherit_goal_options(&mut exec_cli.goal, &root_goal_options);
+            let exec_goal_options = exec_cli.goal.clone();
+            apply_exec_goal_mode_yolo_default(
+                &mut exec_cli,
+                &exec_goal_options,
+                interactive.approval_policy.is_some(),
+            );
             prepend_config_flags(
                 &mut exec_cli.config_overrides,
                 root_config_overrides.clone(),
@@ -990,7 +1081,16 @@ async fn cli_main(arg0_paths: Arg0DispatchPaths) -> anyhow::Result<()> {
             )?;
             let mut exec_cli = ExecCli::try_parse_from(["codex", "exec"])?;
             exec_cli.command = Some(ExecCommand::Review(review_args));
+            exec_cli
+                .shared
+                .inherit_exec_root_options(&interactive.shared);
             inherit_goal_options(&mut exec_cli.goal, &root_goal_options);
+            let exec_goal_options = exec_cli.goal.clone();
+            apply_exec_goal_mode_yolo_default(
+                &mut exec_cli,
+                &exec_goal_options,
+                interactive.approval_policy.is_some(),
+            );
             prepend_config_flags(
                 &mut exec_cli.config_overrides,
                 root_config_overrides.clone(),
@@ -1143,6 +1243,11 @@ async fn cli_main(arg0_paths: Arg0DispatchPaths) -> anyhow::Result<()> {
             } else if apply_interactive_goal_mode_defaults(&mut interactive, &root_goal_options) {
                 enable_goals_feature_by_default(&mut interactive.config_overrides);
             }
+            apply_interactive_goal_mode_yolo_default(&mut interactive, &root_goal_options);
+            apply_interactive_goal_mode_error_recovery_default(
+                &mut interactive,
+                &root_goal_options,
+            );
             let exit_info = run_interactive_tui(
                 interactive,
                 remote.remote.or(root_remote.clone()),
@@ -1172,6 +1277,11 @@ async fn cli_main(arg0_paths: Arg0DispatchPaths) -> anyhow::Result<()> {
             if apply_interactive_goal_mode_defaults(&mut interactive, &root_goal_options) {
                 enable_goals_feature_by_default(&mut interactive.config_overrides);
             }
+            apply_interactive_goal_mode_yolo_default(&mut interactive, &root_goal_options);
+            apply_interactive_goal_mode_error_recovery_default(
+                &mut interactive,
+                &root_goal_options,
+            );
             let exit_info = run_interactive_tui(
                 interactive,
                 remote.remote.or(root_remote.clone()),
@@ -2093,7 +2203,164 @@ mod tests {
         assert_eq!(goal_mode_for_exe_name("codexx-v5"), Some(GoalMode::V5));
         assert_eq!(goal_mode_for_exe_name("codex-v6"), Some(GoalMode::V6));
         assert_eq!(goal_mode_for_exe_name("codexx-v6"), Some(GoalMode::V6));
+        assert_eq!(goal_mode_for_exe_name("codex-v7"), Some(GoalMode::V7));
+        assert_eq!(goal_mode_for_exe_name("codexx-v7"), Some(GoalMode::V7));
         assert_eq!(goal_mode_for_exe_name("codexx"), None);
+        assert_eq!(goal_mode_for_exe_name("codexxx"), None);
+    }
+
+    #[test]
+    fn goal_mode_defaults_interactive_to_yolo() {
+        let mut cli = MultitoolCli::try_parse_from(["codex", "--mode", "v5", "ship this"])
+            .expect("parse should succeed");
+
+        assert!(apply_interactive_goal_mode_yolo_default(
+            &mut cli.interactive,
+            &cli.goal
+        ));
+        assert!(cli.interactive.dangerously_bypass_approvals_and_sandbox);
+    }
+
+    #[test]
+    fn goal_mode_yolo_default_respects_explicit_sandbox() {
+        let mut cli = MultitoolCli::try_parse_from([
+            "codex",
+            "--mode",
+            "v5",
+            "--sandbox",
+            "read-only",
+            "ship this",
+        ])
+        .expect("parse should succeed");
+
+        assert!(!apply_interactive_goal_mode_yolo_default(
+            &mut cli.interactive,
+            &cli.goal
+        ));
+        assert!(!cli.interactive.dangerously_bypass_approvals_and_sandbox);
+        assert!(cli.interactive.sandbox_mode.is_some());
+    }
+
+    #[test]
+    fn goal_mode_yolo_default_respects_explicit_approval_policy() {
+        let mut cli = MultitoolCli::try_parse_from([
+            "codex",
+            "--mode",
+            "v6",
+            "--ask-for-approval",
+            "on-request",
+            "ship this",
+        ])
+        .expect("parse should succeed");
+
+        assert!(!apply_interactive_goal_mode_yolo_default(
+            &mut cli.interactive,
+            &cli.goal
+        ));
+        assert!(!cli.interactive.dangerously_bypass_approvals_and_sandbox);
+        assert!(cli.interactive.approval_policy.is_some());
+    }
+
+    #[test]
+    fn codexx_v6_alias_defaults_to_yolo() {
+        let mut cli =
+            MultitoolCli::try_parse_from(["codexx-v6", "ship this"]).expect("parse should succeed");
+        cli.goal.mode = goal_mode_for_exe_name("codexx-v6");
+
+        assert!(apply_interactive_goal_mode_yolo_default(
+            &mut cli.interactive,
+            &cli.goal
+        ));
+        assert!(cli.interactive.dangerously_bypass_approvals_and_sandbox);
+    }
+
+    #[test]
+    fn interactive_goal_modes_enable_repeated_error_recovery() {
+        for mode in ["v5", "v6", "v7"] {
+            let mut cli = MultitoolCli::try_parse_from(["codex", "--mode", mode])
+                .expect("parse should succeed");
+
+            assert!(
+                apply_interactive_goal_mode_error_recovery_default(&mut cli.interactive, &cli.goal),
+                "mode {mode} should enable recovery"
+            );
+
+            assert!(cli.interactive.auto_fresh_restart_on_repeated_errors);
+        }
+    }
+
+    #[test]
+    fn interactive_repeated_error_recovery_respects_no_goal() {
+        let mut no_goal = MultitoolCli::try_parse_from(["codex", "--mode", "v6", "--no-goal"])
+            .expect("parse should succeed");
+        assert!(!apply_interactive_goal_mode_error_recovery_default(
+            &mut no_goal.interactive,
+            &no_goal.goal
+        ));
+        assert!(!no_goal.interactive.auto_fresh_restart_on_repeated_errors);
+    }
+
+    #[test]
+    fn exec_goal_mode_defaults_to_yolo_after_inheritance() {
+        let MultitoolCli {
+            interactive,
+            mut subcommand,
+            goal: root_goal_options,
+            ..
+        } = MultitoolCli::try_parse_from(["codex", "--mode", "v5", "exec", "ship"])
+            .expect("parse should succeed");
+        let Some(Subcommand::Exec(mut exec_cli)) = subcommand.take() else {
+            panic!("expected exec subcommand");
+        };
+
+        exec_cli
+            .shared
+            .inherit_exec_root_options(&interactive.shared);
+        inherit_goal_options(&mut exec_cli.goal, &root_goal_options);
+        let exec_goal_options = exec_cli.goal.clone();
+
+        assert!(apply_exec_goal_mode_yolo_default(
+            &mut exec_cli,
+            &exec_goal_options,
+            interactive.approval_policy.is_some(),
+        ));
+        assert!(exec_cli.dangerously_bypass_approvals_and_sandbox);
+    }
+
+    #[test]
+    fn exec_goal_mode_yolo_default_respects_exec_sandbox() {
+        let MultitoolCli {
+            interactive,
+            mut subcommand,
+            goal: root_goal_options,
+            ..
+        } = MultitoolCli::try_parse_from([
+            "codex",
+            "--mode",
+            "v6",
+            "exec",
+            "--sandbox",
+            "read-only",
+            "ship",
+        ])
+        .expect("parse should succeed");
+        let Some(Subcommand::Exec(mut exec_cli)) = subcommand.take() else {
+            panic!("expected exec subcommand");
+        };
+
+        exec_cli
+            .shared
+            .inherit_exec_root_options(&interactive.shared);
+        inherit_goal_options(&mut exec_cli.goal, &root_goal_options);
+        let exec_goal_options = exec_cli.goal.clone();
+
+        assert!(!apply_exec_goal_mode_yolo_default(
+            &mut exec_cli,
+            &exec_goal_options,
+            interactive.approval_policy.is_some(),
+        ));
+        assert!(!exec_cli.dangerously_bypass_approvals_and_sandbox);
+        assert!(exec_cli.sandbox_mode.is_some());
     }
 
     #[test]
@@ -2177,6 +2444,57 @@ mod tests {
     }
 
     #[test]
+    fn codexx_v7_resume_sets_context_in_first_message() {
+        let mut cli = MultitoolCli::try_parse_from([
+            "codexx-v7",
+            "resume",
+            "019e13e6-f8bf-7e40-a643-03b3ee50ab25",
+        ])
+        .expect("parse should succeed");
+        if cli.goal.mode.is_none() {
+            cli.goal.mode = goal_mode_for_exe_name("codexx-v7");
+        }
+
+        let MultitoolCli {
+            interactive,
+            config_overrides: root_overrides,
+            subcommand,
+            feature_toggles: _,
+            goal,
+            remote: _,
+        } = cli;
+        let Some(Subcommand::Resume(ResumeCommand {
+            session_id,
+            last,
+            all,
+            include_non_interactive,
+            remote: _,
+            config_overrides: resume_cli,
+        })) = subcommand
+        else {
+            panic!("expected resume subcommand");
+        };
+        let mut interactive = finalize_resume_interactive(
+            interactive,
+            root_overrides,
+            session_id,
+            last,
+            all,
+            include_non_interactive,
+            resume_cli,
+        );
+        interactive.fresh_resume =
+            fresh_resume_options_from_goal_options(&goal).expect("goal options should resolve");
+
+        let fresh_resume = interactive
+            .fresh_resume
+            .expect("codexx-v7 resume should use fresh handoff");
+        assert!(fresh_resume.v6_profile);
+        assert!(fresh_resume.default_status_file);
+        assert!(fresh_resume.context_in_first_message);
+    }
+
+    #[test]
     fn no_status_suppresses_v6_fresh_resume_status_file() {
         let interactive = finalize_resume_from_args(
             [
@@ -2228,6 +2546,21 @@ mod tests {
     }
 
     #[test]
+    fn codexx_v6_alias_prompt_is_parsed_as_goal_command() {
+        let mut cli =
+            MultitoolCli::try_parse_from(["codexx-v6", "ship this"]).expect("parse should succeed");
+        cli.goal.mode = goal_mode_for_exe_name("codexx-v6");
+
+        assert!(apply_interactive_goal_mode_defaults(
+            &mut cli.interactive,
+            &cli.goal
+        ));
+
+        assert_eq!(cli.interactive.prompt.as_deref(), Some("/goal ship this"));
+        assert!(cli.interactive.initial_prompt_parse_slash);
+    }
+
+    #[test]
     fn interactive_goal_mode_does_not_double_prefix_goal_command() {
         let mut cli = MultitoolCli::try_parse_from(["codex", "--mode", "v6", " /goal ship this"])
             .expect("parse should succeed");
@@ -2239,6 +2572,20 @@ mod tests {
 
         assert_eq!(cli.interactive.prompt.as_deref(), Some("/goal ship this"));
         assert!(cli.interactive.initial_prompt_parse_slash);
+    }
+
+    #[test]
+    fn interactive_goal_mode_without_startup_prompt_is_native_noop() {
+        let mut cli =
+            MultitoolCli::try_parse_from(["codex", "--mode", "v6"]).expect("parse should succeed");
+
+        assert!(!apply_interactive_goal_mode_defaults(
+            &mut cli.interactive,
+            &cli.goal
+        ));
+
+        assert!(cli.interactive.prompt.is_none());
+        assert!(!cli.interactive.initial_prompt_parse_slash);
     }
 
     #[test]
@@ -2265,6 +2612,7 @@ mod tests {
         let root = GoalCliOptions {
             mode: Some(GoalMode::V5),
             goal: true,
+            fresh_resume_context_in_first_message: true,
             turns: Some(3),
             next: Some("continue".to_string()),
             ..Default::default()
@@ -2275,6 +2623,7 @@ mod tests {
 
         assert_eq!(target.mode, Some(GoalMode::V5));
         assert!(target.goal);
+        assert!(target.fresh_resume_context_in_first_message);
         assert_eq!(target.turns, Some(3));
         assert_eq!(target.next.as_deref(), Some("continue"));
     }
@@ -2361,6 +2710,17 @@ mod tests {
         let err = MultitoolCli::try_parse_from(args).expect_err("help should short-circuit");
         assert_eq!(err.kind(), clap::error::ErrorKind::DisplayHelp);
         err.to_string()
+    }
+
+    #[test]
+    fn version_output_identifies_codexx_local_build() {
+        let err = MultitoolCli::try_parse_from(["codexx", "--version"])
+            .expect_err("version should short-circuit");
+        assert_eq!(err.kind(), clap::error::ErrorKind::DisplayVersion);
+        let version = err.to_string();
+        assert!(version.contains("codexx "), "{version}");
+        assert!(version.contains("-codexx-local"), "{version}");
+        assert!(version.contains("upstream codex-cli"), "{version}");
     }
 
     #[test]
@@ -2531,7 +2891,7 @@ mod tests {
             lines,
             vec![
                 "Token usage: total=2 input=0 output=2".to_string(),
-                "To continue this session, run codexx resume 123e4567-e89b-12d3-a456-426614174000"
+                "To continue this session, run codex resume 123e4567-e89b-12d3-a456-426614174000"
                     .to_string(),
             ]
         );
@@ -2559,7 +2919,7 @@ mod tests {
             lines,
             vec![
                 "Token usage: total=2 input=0 output=2".to_string(),
-                "To continue this session, run codexx resume 123e4567-e89b-12d3-a456-426614174000"
+                "To continue this session, run codex resume 123e4567-e89b-12d3-a456-426614174000"
                     .to_string(),
             ]
         );

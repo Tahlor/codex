@@ -490,6 +490,158 @@ impl App {
         tui.frame_requester().schedule_frame();
     }
 
+    pub(super) async fn start_fresh_session_from_repeated_error_recovery(
+        &mut self,
+        tui: &mut tui::Tui,
+        app_server: &mut AppServerSession,
+        source_thread_id: ThreadId,
+        error_message: String,
+    ) {
+        print_previous_session_before_restart(tui, source_thread_id).await;
+        self.refresh_in_memory_config_from_disk_best_effort("recovering from repeated errors")
+            .await;
+
+        let model = self.chat_widget.current_model().to_string();
+        let config = self.fresh_session_config();
+        let summary = session_summary(
+            self.chat_widget.token_usage(),
+            self.chat_widget.thread_id(),
+            self.chat_widget.thread_name(),
+            self.chat_widget.rollout_path().as_deref(),
+        );
+        let source_target = SessionTarget {
+            path: self.chat_widget.rollout_path(),
+            thread_id: source_thread_id,
+        };
+        let options = crate::FreshResumeCliOptions {
+            first_goal: false,
+            last_goal: false,
+            default_status_file: true,
+            status_file: None,
+            context_file: None,
+            handoff_dir: None,
+            v6_profile: true,
+            context_in_first_message: false,
+        };
+        let extra_prompt = format!(
+            "The source session hit this Codex error while automatic fresh-session recovery was active:\n{error_message}"
+        );
+
+        let started = match app_server
+            .start_thread_with_session_start_source(&config, /*session_start_source*/ None)
+            .await
+        {
+            Ok(started) => started,
+            Err(err) => {
+                self.chat_widget.add_error_message(format!(
+                    "Failed to start a fresh session after repeated errors: {err}"
+                ));
+                self.config.model = Some(model);
+                tui.frame_requester().schedule_frame();
+                return;
+            }
+        };
+
+        let (objective, startup_prompt) = match crate::prepare_fresh_resume_startup(
+            app_server,
+            &config,
+            self.state_db.as_ref(),
+            &source_target,
+            &options,
+            started.session.thread_id,
+            Some(&extra_prompt),
+        )
+        .await
+        {
+            Ok(startup) => startup,
+            Err(err) => {
+                let started_thread_id = started.session.thread_id;
+                if let Err(unsubscribe_err) = app_server.thread_unsubscribe(started_thread_id).await
+                {
+                    tracing::warn!(
+                        "failed to unsubscribe unused recovery thread {started_thread_id}: {unsubscribe_err}"
+                    );
+                }
+                self.chat_widget.add_error_message(format!(
+                    "Failed to prepare repeated-error recovery handoff: {err}"
+                ));
+                self.config.model = Some(model);
+                tui.frame_requester().schedule_frame();
+                return;
+            }
+        };
+
+        let started_thread_id = started.session.thread_id;
+        if let Err(err) = app_server
+            .thread_goal_set(
+                started_thread_id,
+                Some(objective),
+                Some(AppThreadGoalStatus::Active),
+                /*token_budget*/ None,
+            )
+            .await
+        {
+            self.chat_widget.add_error_message(format!(
+                "Failed to set recovery goal for fresh session {started_thread_id}: {err}"
+            ));
+        }
+
+        let initial_user_message = crate::chatwidget::create_initial_user_message(
+            Some(startup_prompt),
+            Vec::new(),
+            Vec::new(),
+        );
+
+        self.shutdown_current_thread(app_server).await;
+        let tracked_thread_ids: Vec<ThreadId> =
+            self.thread_event_channels.keys().copied().collect();
+        for thread_id in tracked_thread_ids {
+            if thread_id == started_thread_id {
+                continue;
+            }
+            if let Err(err) = app_server.thread_unsubscribe(thread_id).await {
+                tracing::warn!("failed to unsubscribe tracked thread {thread_id}: {err}");
+            }
+        }
+
+        self.config = config.clone();
+        match self
+            .replace_chat_widget_with_app_server_thread(
+                tui,
+                app_server,
+                started,
+                initial_user_message,
+            )
+            .await
+        {
+            Ok(()) => {
+                self.chat_widget.add_info_message(
+                    "Started a fresh session after an unrecoverable error.".to_string(),
+                    /*hint*/ None,
+                );
+                if let Some(summary) = summary {
+                    let mut lines: Vec<Line<'static>> = Vec::new();
+                    if let Some(usage_line) = summary.usage_line {
+                        lines.push(usage_line.into());
+                    }
+                    if let Some(command) = summary.resume_command {
+                        let spans = vec!["To continue this session, run ".into(), command.cyan()];
+                        lines.push(spans.into());
+                    }
+                    self.chat_widget.add_plain_history_lines(lines);
+                }
+            }
+            Err(err) => {
+                self.chat_widget.add_error_message(format!(
+                    "Failed to attach to fresh repeated-error recovery thread: {err}"
+                ));
+                self.config.model = Some(model);
+            }
+        }
+
+        tui.frame_requester().schedule_frame();
+    }
+
     pub(super) async fn replace_chat_widget_with_app_server_thread(
         &mut self,
         tui: &mut tui::Tui,

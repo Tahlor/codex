@@ -252,7 +252,13 @@ def stage_sources(staging_dir: Path, version: str, package: str) -> None:
     if package == "codex":
         bin_dir = staging_dir / "bin"
         bin_dir.mkdir(parents=True, exist_ok=True)
-        for launcher in ("codex.js", "codex-v5.js", "codex-v6.js"):
+        for launcher in (
+            "codex.js",
+            "codex-v5.js",
+            "codex-v6.js",
+            "codex-v7.js",
+            "patch-wsl-shims.js",
+        ):
             shutil.copy2(CODEX_CLI_ROOT / "bin" / launcher, bin_dir / launcher)
         rg_manifest = CODEX_CLI_ROOT / "bin" / "rg"
         if rg_manifest.exists():

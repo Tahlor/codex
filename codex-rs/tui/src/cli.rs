@@ -42,6 +42,10 @@ pub struct Cli {
     #[clap(skip)]
     pub fresh_resume: Option<FreshResumeCliOptions>,
 
+    /// Internal: in v6 profile mode, recover repeated error failures in a fresh thread.
+    #[clap(skip)]
+    pub auto_fresh_restart_on_repeated_errors: bool,
+
     // Internal controls set by the top-level `codex fork` subcommand.
     // These are not exposed as user flags on the base `codex` command.
     #[clap(skip)]
@@ -91,6 +95,7 @@ pub struct FreshResumeCliOptions {
     pub context_file: Option<PathBuf>,
     pub handoff_dir: Option<PathBuf>,
     pub v6_profile: bool,
+    pub context_in_first_message: bool,
 }
 
 impl std::ops::Deref for Cli {

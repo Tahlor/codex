@@ -115,6 +115,33 @@ fn v6_mode_defaults_to_fresh_resume() {
 }
 
 #[test]
+fn v7_mode_defaults_to_first_message_resume_context() {
+    let cli = Cli::parse_from(["codex-exec", "--mode", "v7", "resume", "session-id"]);
+
+    let resolved = cli.goal.resolve().expect("goal options should resolve");
+    assert_eq!(resolved.mode, Some(GoalMode::V7));
+    assert!(resolved.goal);
+    assert!(resolved.fresh_resume);
+    assert!(resolved.fresh_resume_context_in_first_message);
+    assert!(resolved.default_status_file);
+}
+
+#[test]
+fn first_message_resume_context_flag_is_explicit_without_v7() {
+    let cli = Cli::parse_from([
+        "codex-exec",
+        "--fresh-resume",
+        "--fresh-resume-context-in-first-message",
+        "resume",
+        "session-id",
+    ]);
+
+    let resolved = cli.goal.resolve().expect("goal options should resolve");
+    assert!(resolved.fresh_resume);
+    assert!(resolved.fresh_resume_context_in_first_message);
+}
+
+#[test]
 fn status_flag_enables_default_status_file_without_profile_mode() {
     let cli = Cli::parse_from(["codex-exec", "--status", "ship"]);
 

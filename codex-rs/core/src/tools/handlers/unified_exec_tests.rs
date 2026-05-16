@@ -50,8 +50,13 @@ fn test_get_command_uses_default_shell_when_unspecified() -> anyhow::Result<()> 
     )
     .map_err(anyhow::Error::msg)?;
 
-    assert_eq!(command.len(), 3);
-    assert_eq!(command[2], "echo hello");
+    assert_eq!(command.last(), Some(&"echo hello".to_string()));
+    if command
+        .iter()
+        .any(|arg| arg.eq_ignore_ascii_case("-Command"))
+    {
+        assert!(command.contains(&"-NoProfile".to_string()));
+    }
     Ok(())
 }
 
@@ -97,7 +102,8 @@ fn test_get_command_respects_explicit_powershell_shell() -> anyhow::Result<()> {
     )
     .map_err(anyhow::Error::msg)?;
 
-    assert_eq!(command[2], "echo hello");
+    assert_eq!(command.last(), Some(&"echo hello".to_string()));
+    assert!(command.contains(&"-NoProfile".to_string()));
     Ok(())
 }
 

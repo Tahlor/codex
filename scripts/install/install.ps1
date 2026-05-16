@@ -7,7 +7,7 @@ $ErrorActionPreference = "Stop"
 $ProgressPreference = "SilentlyContinue"
 
 $PrimaryCommand = "codexx"
-$AliasCommands = @("codex-v5", "codex-v6", "codexx-v5", "codexx-v6")
+$AliasCommands = @("codexxx", "codex-v5", "codex-v6", "codex-v7", "codexx-v5", "codexx-v6", "codexx-v7")
 $ReleaseRepo = if ([string]::IsNullOrWhiteSpace($env:CODEXX_RELEASE_REPO)) {
     "Tahlor/codex"
 } else {
@@ -470,10 +470,13 @@ function Test-ReleaseIsComplete {
 
     $expectedFiles = @(
         "$PrimaryCommand.exe",
+        "codexxx.exe",
         "codex-v5.exe",
         "codex-v6.exe",
+        "codex-v7.exe",
         "codexx-v5.exe",
         "codexx-v6.exe",
+        "codexx-v7.exe",
         "codex-resources\codex-command-runner.exe",
         "codex-resources\codex-windows-sandbox-setup.exe",
         "codex-resources\rg.exe"

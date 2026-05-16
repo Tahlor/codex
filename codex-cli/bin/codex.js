@@ -23,48 +23,67 @@ const PLATFORM_PACKAGE_BY_TARGET = {
 
 const { platform, arch } = process;
 
-let targetTriple = null;
-switch (platform) {
-  case "linux":
-  case "android":
-    switch (arch) {
-      case "x64":
-        targetTriple = "x86_64-unknown-linux-musl";
-        break;
-      case "arm64":
-        targetTriple = "aarch64-unknown-linux-musl";
-        break;
-      default:
-        break;
-    }
-    break;
-  case "darwin":
-    switch (arch) {
-      case "x64":
-        targetTriple = "x86_64-apple-darwin";
-        break;
-      case "arm64":
-        targetTriple = "aarch64-apple-darwin";
-        break;
-      default:
-        break;
-    }
-    break;
-  case "win32":
-    switch (arch) {
-      case "x64":
-        targetTriple = "x86_64-pc-windows-msvc";
-        break;
-      case "arm64":
-        targetTriple = "aarch64-pc-windows-msvc";
-        break;
-      default:
-        break;
-    }
-    break;
-  default:
-    break;
+function targetTripleFor(platformName, architecture) {
+  switch (platformName) {
+    case "linux":
+    case "android":
+      switch (architecture) {
+        case "x64":
+          return "x86_64-unknown-linux-musl";
+        case "arm64":
+          return "aarch64-unknown-linux-musl";
+        default:
+          return null;
+      }
+    case "darwin":
+      switch (architecture) {
+        case "x64":
+          return "x86_64-apple-darwin";
+        case "arm64":
+          return "aarch64-apple-darwin";
+        default:
+          return null;
+      }
+    case "win32":
+      switch (architecture) {
+        case "x64":
+          return "x86_64-pc-windows-msvc";
+        case "arm64":
+          return "aarch64-pc-windows-msvc";
+        default:
+          return null;
+      }
+    default:
+      return null;
+  }
 }
+
+function isWsl() {
+  if (platform !== "linux") {
+    return false;
+  }
+  if (process.env.WSL_DISTRO_NAME || process.env.WSL_INTEROP) {
+    return true;
+  }
+  try {
+    return existsSync("/proc/sys/fs/binfmt_misc/WSLInterop");
+  } catch {
+    return false;
+  }
+}
+
+function isWslWindowsMountPath(value) {
+  return /^\/mnt\/[a-z](?:\/|$)/i.test(value);
+}
+
+function wslWindowsTargetTriple() {
+  if (!isWsl() || !isWslWindowsMountPath(__dirname)) {
+    return null;
+  }
+  return targetTripleFor("win32", arch);
+}
+
+const targetTriple = wslWindowsTargetTriple() ?? targetTripleFor(platform, arch);
 
 if (!targetTriple) {
   throw new Error(`Unsupported platform: ${platform} (${arch})`);
@@ -75,7 +94,8 @@ if (!platformPackage) {
   throw new Error(`Unsupported target triple: ${targetTriple}`);
 }
 
-const codexBinaryName = process.platform === "win32" ? "codex.exe" : "codex";
+const targetIsWindows = targetTriple.endsWith("-pc-windows-msvc");
+const codexBinaryName = targetIsWindows ? "codex.exe" : "codex";
 const localVendorRoot = path.join(__dirname, "..", "vendor");
 const localBinaryPath = path.join(
   localVendorRoot,
@@ -83,15 +103,78 @@ const localBinaryPath = path.join(
   "codex",
   codexBinaryName,
 );
+const checkoutDebugRoot = path.join(
+  __dirname,
+  "..",
+  "..",
+  "codex-rs",
+  "target",
+  "debug",
+);
+const checkoutDebugBinaryPath = path.join(checkoutDebugRoot, codexBinaryName);
+const checkoutDebugDepsRoot = path.join(checkoutDebugRoot, "deps");
+const checkoutDebugDepsBinaryPath = path.join(
+  checkoutDebugDepsRoot,
+  codexBinaryName,
+);
+const checkoutActiveDebugRoot = path.join(
+  __dirname,
+  "..",
+  "..",
+  "codex-rs",
+  "target",
+  "codexx-active",
+  "debug",
+);
+const checkoutActiveDebugBinaryPath = path.join(
+  checkoutActiveDebugRoot,
+  codexBinaryName,
+);
+const additionalDirs = [];
 
-let vendorRoot;
-try {
-  const packageJsonPath = require.resolve(`${platformPackage}/package.json`);
-  vendorRoot = path.join(path.dirname(packageJsonPath), "vendor");
-} catch {
-  if (existsSync(localBinaryPath)) {
-    vendorRoot = localVendorRoot;
-  } else {
+let binaryPath;
+if (existsSync(checkoutActiveDebugBinaryPath)) {
+  binaryPath = checkoutActiveDebugBinaryPath;
+  additionalDirs.push(checkoutActiveDebugRoot);
+  const localPathDir = path.join(localVendorRoot, targetTriple, "path");
+  if (existsSync(localPathDir)) {
+    additionalDirs.push(localPathDir);
+  }
+} else if (existsSync(checkoutDebugDepsBinaryPath)) {
+  binaryPath = checkoutDebugDepsBinaryPath;
+  additionalDirs.push(checkoutDebugDepsRoot, checkoutDebugRoot);
+  const localPathDir = path.join(localVendorRoot, targetTriple, "path");
+  if (existsSync(localPathDir)) {
+    additionalDirs.push(localPathDir);
+  }
+} else if (existsSync(checkoutDebugBinaryPath)) {
+  binaryPath = checkoutDebugBinaryPath;
+  additionalDirs.push(checkoutDebugRoot);
+  const localPathDir = path.join(localVendorRoot, targetTriple, "path");
+  if (existsSync(localPathDir)) {
+    additionalDirs.push(localPathDir);
+  }
+} else {
+  let vendorRoot;
+  try {
+    const packageJsonPath = require.resolve(`${platformPackage}/package.json`);
+    vendorRoot = path.join(path.dirname(packageJsonPath), "vendor");
+  } catch {
+    if (existsSync(localBinaryPath)) {
+      vendorRoot = localVendorRoot;
+    } else {
+      const packageManager = detectPackageManager();
+      const updateCommand =
+        packageManager === "bun"
+          ? "bun install -g codexx@latest"
+          : "npm install -g codexx@latest";
+      throw new Error(
+        `Missing optional dependency ${platformPackage}. Reinstall Codex: ${updateCommand}`,
+      );
+    }
+  }
+
+  if (!vendorRoot) {
     const packageManager = detectPackageManager();
     const updateCommand =
       packageManager === "bun"
@@ -101,21 +184,14 @@ try {
       `Missing optional dependency ${platformPackage}. Reinstall Codex: ${updateCommand}`,
     );
   }
-}
 
-if (!vendorRoot) {
-  const packageManager = detectPackageManager();
-  const updateCommand =
-    packageManager === "bun"
-      ? "bun install -g codexx@latest"
-      : "npm install -g codexx@latest";
-  throw new Error(
-    `Missing optional dependency ${platformPackage}. Reinstall Codex: ${updateCommand}`,
-  );
+  const archRoot = path.join(vendorRoot, targetTriple);
+  binaryPath = path.join(archRoot, "codex", codexBinaryName);
+  const pathDir = path.join(archRoot, "path");
+  if (existsSync(pathDir)) {
+    additionalDirs.push(pathDir);
+  }
 }
-
-const archRoot = path.join(vendorRoot, targetTriple);
-const binaryPath = path.join(archRoot, "codex", codexBinaryName);
 
 // Use an asynchronous spawn instead of spawnSync so that Node is able to
 // respond to signals (e.g. Ctrl-C / SIGINT) while the native binary is
@@ -158,11 +234,6 @@ function detectPackageManager() {
   return userAgent ? "npm" : null;
 }
 
-const additionalDirs = [];
-const pathDir = path.join(archRoot, "path");
-if (existsSync(pathDir)) {
-  additionalDirs.push(pathDir);
-}
 const updatedPath = getUpdatedPath(additionalDirs);
 
 const env = { ...process.env, PATH: updatedPath };
@@ -178,7 +249,7 @@ function launcherModeArgs(userArgs) {
   }
 
   const wrapperMode = process.env.CODEX_WRAPPER_MODE;
-  if (wrapperMode === "v5" || wrapperMode === "v6") {
+  if (wrapperMode === "v5" || wrapperMode === "v6" || wrapperMode === "v7") {
     return ["--mode", wrapperMode];
   }
 
@@ -189,6 +260,9 @@ function launcherModeArgs(userArgs) {
   }
   if (launcherName === "codex-v6" || launcherName === "codexx-v6") {
     return ["--mode", "v6"];
+  }
+  if (launcherName === "codex-v7" || launcherName === "codexx-v7") {
+    return ["--mode", "v7"];
   }
   return [];
 }

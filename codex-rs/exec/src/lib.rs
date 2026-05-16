@@ -92,6 +92,7 @@ use codex_protocol::models::ActivePermissionProfileModification;
 use codex_protocol::models::PermissionProfile;
 use codex_protocol::protocol::AskForApproval;
 use codex_protocol::protocol::EventMsg;
+use codex_protocol::protocol::MAX_THREAD_GOAL_OBJECTIVE_CHARS;
 use codex_protocol::protocol::ReviewRequest;
 use codex_protocol::protocol::ReviewTarget;
 use codex_protocol::protocol::RolloutItem;
@@ -218,6 +219,8 @@ struct FreshResumeSeed {
     objective: String,
 }
 
+const DEFAULT_GOAL_HANDOFF_ROOT: &str = ".codex";
+
 #[derive(Clone, Copy, Debug)]
 enum HistoricalGoalPick {
     First,
@@ -237,10 +240,11 @@ fn default_handoff_dir(
 ) -> PathBuf {
     resolve_workspace_path(
         config.cwd.as_path(),
-        options
-            .handoff_dir
-            .clone()
-            .unwrap_or_else(|| PathBuf::from(".codexx").join("sessions").join(thread_id)),
+        options.handoff_dir.clone().unwrap_or_else(|| {
+            PathBuf::from(DEFAULT_GOAL_HANDOFF_ROOT)
+                .join("sessions")
+                .join(thread_id)
+        }),
     )
 }
 
@@ -337,6 +341,119 @@ fn prompt_with_handoff(prompt: &str, handoff: &GoalHandoff) -> String {
     } else {
         format!("{}\n\n{}", prompt, additions.join("\n"))
     }
+}
+
+fn char_count(value: &str) -> usize {
+    value.chars().count()
+}
+
+fn short_fresh_resume_objective(source_thread_id: &str) -> String {
+    format!("Resume what you were doing in Codex session {source_thread_id}.")
+}
+
+fn recovered_fresh_resume_goal_objective(seed: &FreshResumeSeed) -> String {
+    let recovered_objective = seed.objective.trim();
+    if !recovered_objective.is_empty()
+        && char_count(recovered_objective) <= MAX_THREAD_GOAL_OBJECTIVE_CHARS
+    {
+        return recovered_objective.to_string();
+    }
+
+    short_fresh_resume_objective(&seed.source_thread_id)
+}
+
+fn resume_command_for_thread_id(thread_id: &str) -> String {
+    ThreadId::from_string(thread_id)
+        .ok()
+        .and_then(|thread_id| {
+            codex_core::util::resume_command(/*thread_name*/ None, Some(thread_id))
+        })
+        .unwrap_or_else(|| format!("codex resume {thread_id}"))
+}
+
+fn previous_session_before_restart_message(thread_id: &str) -> String {
+    format!(
+        "Previous session before fresh restart: {}",
+        resume_command_for_thread_id(thread_id)
+    )
+}
+
+fn recovered_goal_from_scaffold(objective: &str) -> Option<&str> {
+    if !objective.starts_with("Continue the recovered goal from Codex session ") {
+        return None;
+    }
+    let (_, recovered) = objective.split_once("Recovered goal:\n")?;
+    let recovered = recovered
+        .split("\n\nRead the bounded")
+        .next()
+        .unwrap_or(recovered)
+        .split("\n\nUse the recovered source")
+        .next()
+        .unwrap_or(recovered)
+        .trim();
+    Some(recovered)
+}
+
+fn meaningful_goal_objective(objective: &str) -> Option<String> {
+    let objective = objective.trim();
+    if objective.is_empty() {
+        return None;
+    }
+    if let Some(recovered) = recovered_goal_from_scaffold(objective) {
+        return meaningful_goal_objective(recovered);
+    }
+    if objective == "Continue the active goal."
+        || objective == "Continue the active goal and ship the next useful improvement."
+        || objective.starts_with("Resume what you were doing in Codex session ")
+        || (objective.starts_with("Continue the work from source thread ")
+            && !objective.contains("Source name:"))
+    {
+        return None;
+    }
+    Some(objective.to_string())
+}
+
+fn bounded_fresh_resume_goal_objective(seed: &FreshResumeSeed, handoff: &GoalHandoff) -> String {
+    let context_instruction = handoff
+        .context_file
+        .as_deref()
+        .map(|path| {
+            format!(
+                "Read the bounded context at `{}` before continuing.",
+                path.display()
+            )
+        })
+        .unwrap_or_else(|| {
+            "Use the recovered source thread if more context is needed.".to_string()
+        });
+    let candidate = format!(
+        "Continue the recovered goal from Codex session {}.\n\n\
+Recovered goal:\n{}\n\n\
+{}",
+        seed.source_thread_id,
+        seed.objective.trim(),
+        context_instruction
+    );
+    if char_count(&candidate) <= MAX_THREAD_GOAL_OBJECTIVE_CHARS {
+        return candidate;
+    }
+
+    let fallback_with_context = format!(
+        "{} {}",
+        short_fresh_resume_objective(&seed.source_thread_id),
+        context_instruction
+    );
+    if char_count(&fallback_with_context) <= MAX_THREAD_GOAL_OBJECTIVE_CHARS {
+        return fallback_with_context;
+    }
+
+    short_fresh_resume_objective(&seed.source_thread_id)
+}
+
+fn acknowledge_fresh_resume_prompt(prompt: String) -> String {
+    format!(
+        "{prompt}\n\nAfter reading this message and the referenced files, reply exactly with `acknowledge`."
+    )
 }
 
 fn write_latest_recovery_context(
@@ -503,12 +620,12 @@ async fn goal_objective_from_rollout_path(
         let RolloutItem::EventMsg(EventMsg::ThreadGoalUpdated(event)) = rollout_line.item else {
             continue;
         };
-        if event.goal.objective.trim().is_empty() {
+        let Some(objective) = meaningful_goal_objective(&event.goal.objective) else {
             continue;
-        }
+        };
         match pick {
-            HistoricalGoalPick::First => return Ok(Some(event.goal.objective)),
-            HistoricalGoalPick::Last => selected = Some(event.goal.objective),
+            HistoricalGoalPick::First => return Ok(Some(objective)),
+            HistoricalGoalPick::Last => selected = Some(objective),
         }
     }
     Ok(selected)
@@ -1034,6 +1151,11 @@ async fn run_exec_session(args: ExecRunArgs) -> anyhow::Result<()> {
             (session_configured.thread_id, session_configured)
         }
     } else {
+        if let Some(seed) = fresh_resume_seed.as_ref() {
+            event_processor.process_warning(previous_session_before_restart_message(
+                &seed.source_thread_id,
+            ));
+        }
         let response: ThreadStartResponse = send_request_with_response(
             &client,
             ClientRequest::ThreadStart {
@@ -1080,6 +1202,17 @@ async fn run_exec_session(args: ExecRunArgs) -> anyhow::Result<()> {
                 let seed = fresh_resume_seed
                     .as_ref()
                     .expect("fresh resume seed checked above");
+                let goal_objective = if goal_options.fresh_resume_context_in_first_message {
+                    recovered_fresh_resume_goal_objective(seed)
+                } else {
+                    bounded_fresh_resume_goal_objective(seed, &goal_handoff)
+                };
+                let prompt_objective = format!(
+                    "Continue the recovered goal from Codex session {}.\n\n\
+Recovered goal:\n{}",
+                    seed.source_thread_id,
+                    seed.objective.trim()
+                );
                 let extra_prompt = args
                     .prompt
                     .clone()
@@ -1087,11 +1220,14 @@ async fn run_exec_session(args: ExecRunArgs) -> anyhow::Result<()> {
                     .map(|prompt| resolve_prompt(Some(prompt)));
                 let base_prompt = match extra_prompt {
                     Some(extra) if !extra.trim().is_empty() => {
-                        format!("{}\n\n{}", seed.objective, extra)
+                        format!("{prompt_objective}\n\nAdditional user instruction:\n{extra}")
                     }
-                    _ => seed.objective.clone(),
+                    _ => prompt_objective,
                 };
-                let prompt_text = prompt_with_handoff(&base_prompt, &goal_handoff);
+                let mut prompt_text = prompt_with_handoff(&base_prompt, &goal_handoff);
+                if goal_options.fresh_resume_context_in_first_message {
+                    prompt_text = acknowledge_fresh_resume_prompt(prompt_text);
+                }
                 let mut items: Vec<UserInput> = imgs
                     .into_iter()
                     .chain(args.images.iter().cloned())
@@ -1110,7 +1246,7 @@ async fn run_exec_session(args: ExecRunArgs) -> anyhow::Result<()> {
                     },
                     prompt_text,
                     Some(base_prompt.clone()),
-                    Some(base_prompt),
+                    Some(goal_objective),
                 )
             }
             (Some(ExecCommand::Resume(args)), root_prompt, imgs) => {
@@ -1363,6 +1499,7 @@ async fn start_user_turn_with_recovery(
             .as_deref()
             .unwrap_or("The previous turn failed before producing a final agent message.");
         write_latest_recovery_context(goal_handoff, goal_objective, latest_status)?;
+        event_processor.process_warning(previous_session_before_restart_message(thread_id));
         let session_configured = start_new_thread(client, request_ids, config).await?;
         *thread_id = session_configured.thread_id.to_string();
         exec_span.record("thread.id", thread_id.as_str());

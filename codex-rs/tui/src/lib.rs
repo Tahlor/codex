@@ -50,6 +50,7 @@ use codex_protocol::config_types::AltScreenMode;
 use codex_protocol::config_types::SandboxMode;
 use codex_protocol::config_types::WindowsSandboxLevel;
 use codex_protocol::protocol::EventMsg;
+use codex_protocol::protocol::MAX_THREAD_GOAL_OBJECTIVE_CHARS;
 use codex_protocol::protocol::RolloutItem;
 use codex_protocol::protocol::RolloutLine;
 use codex_rollout::StateDbHandle;
@@ -647,6 +648,14 @@ struct FreshResumeHandoff {
     context_file: PathBuf,
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum FreshResumePromptMode {
+    Continue,
+    AcknowledgeOnly,
+}
+
+const DEFAULT_GOAL_HANDOFF_ROOT: &str = ".codex";
+
 #[derive(Clone, Debug)]
 pub(crate) struct FreshResumeStartup {
     pub(crate) target_session: resume_picker::SessionTarget,
@@ -678,7 +687,7 @@ fn default_fresh_resume_handoff_dir(
     continuation_thread_id: ThreadId,
 ) -> PathBuf {
     let relative = options.handoff_dir.clone().unwrap_or_else(|| {
-        PathBuf::from(".codexx")
+        PathBuf::from(DEFAULT_GOAL_HANDOFF_ROOT)
             .join("sessions")
             .join(continuation_thread_id.to_string())
     });
@@ -817,6 +826,7 @@ fn build_fresh_resume_prompt(
     objective: &str,
     handoff: &FreshResumeHandoff,
     extra_prompt: Option<&str>,
+    mode: FreshResumePromptMode,
 ) -> String {
     let source_detail = target_session
         .path
@@ -839,20 +849,115 @@ fn build_fresh_resume_prompt(
         })
         .unwrap_or_default();
 
+    let final_instruction = match mode {
+        FreshResumePromptMode::Continue => "Continue the recovered goal from here.",
+        FreshResumePromptMode::AcknowledgeOnly => {
+            "After reading this message and the referenced files, reply exactly with `acknowledge`."
+        }
+    };
+
     format!(
         "You are finishing work that began in another Codex session.\n\n\
 This is a fresh continuation, not a native session resume. The previous thread history is not loaded.\n\n\
 Source thread: `{}`\n{}\
 Recovered goal:\n{}\n{}\
 Read the bounded context at `{}` before continuing.{} If more detail is needed, inspect the source rollout or use the source thread id above to find the saved session.\n\n\
-Continue the recovered goal from here.",
+{}",
         target_session.thread_id,
         source_detail,
         objective,
         extra,
         handoff.context_file.display(),
-        status_instruction
+        status_instruction,
+        final_instruction
     )
+}
+
+fn char_count(value: &str) -> usize {
+    value.chars().count()
+}
+
+fn short_fresh_resume_objective(source_thread_id: &ThreadId) -> String {
+    format!("Resume what you were doing in Codex session {source_thread_id}.")
+}
+
+fn recovered_fresh_resume_goal_objective(
+    target_session: &resume_picker::SessionTarget,
+    recovered_objective: &str,
+) -> String {
+    let recovered_objective = recovered_objective.trim();
+    if !recovered_objective.is_empty()
+        && char_count(recovered_objective) <= MAX_THREAD_GOAL_OBJECTIVE_CHARS
+    {
+        return recovered_objective.to_string();
+    }
+
+    short_fresh_resume_objective(&target_session.thread_id)
+}
+
+fn recovered_goal_from_scaffold(objective: &str) -> Option<&str> {
+    if !objective.starts_with("Continue the recovered goal from Codex session ") {
+        return None;
+    }
+    let (_, recovered) = objective.split_once("Recovered goal:\n")?;
+    let recovered = recovered
+        .split("\n\nRead the bounded")
+        .next()
+        .unwrap_or(recovered)
+        .split("\n\nUse the recovered source")
+        .next()
+        .unwrap_or(recovered)
+        .trim();
+    Some(recovered)
+}
+
+fn meaningful_goal_objective(objective: &str) -> Option<String> {
+    let objective = objective.trim();
+    if objective.is_empty() {
+        return None;
+    }
+    if let Some(recovered) = recovered_goal_from_scaffold(objective) {
+        return meaningful_goal_objective(recovered);
+    }
+    if objective == "Continue the active goal."
+        || objective == "Continue the active goal and ship the next useful improvement."
+        || objective.starts_with("Resume what you were doing in Codex session ")
+        || (objective.starts_with("Continue the work from source thread ")
+            && !objective.contains("Source name:"))
+    {
+        return None;
+    }
+    Some(objective.to_string())
+}
+
+fn bounded_fresh_resume_goal_objective(
+    target_session: &resume_picker::SessionTarget,
+    recovered_objective: &str,
+    handoff: &FreshResumeHandoff,
+) -> String {
+    let recovered_objective = recovered_objective.trim();
+    let candidate = format!(
+        "Continue the recovered goal from Codex session {}.\n\n\
+Recovered goal:\n{}\n\n\
+Read the bounded context at `{}` before continuing.",
+        target_session.thread_id,
+        recovered_objective,
+        handoff.context_file.display()
+    );
+    if char_count(&candidate) <= MAX_THREAD_GOAL_OBJECTIVE_CHARS {
+        return candidate;
+    }
+
+    let fallback_with_context = format!(
+        "{} Read the bounded context at `{}` before continuing.",
+        short_fresh_resume_objective(&target_session.thread_id),
+        handoff.context_file.display()
+    );
+    if char_count(&fallback_with_context) <= MAX_THREAD_GOAL_OBJECTIVE_CHARS {
+        return fallback_with_context;
+    }
+
+    short_fresh_resume_objective(&target_session.thread_id)
 }
 
 async fn recover_fresh_resume_objective(
@@ -916,20 +1021,16 @@ async fn recover_current_goal_objective(
 }
 
 fn fallback_fresh_resume_objective(thread: &AppServerThread) -> String {
-    let source_summary = thread
+    let source_name = thread
         .name
         .as_deref()
         .map(str::trim)
-        .filter(|name| !name.is_empty())
-        .or_else(|| {
-            let preview = thread.preview.trim();
-            (!preview.is_empty()).then_some(preview)
-        });
+        .filter(|name| !name.is_empty());
 
-    match source_summary {
-        Some(summary) => format!(
-            "Continue the work from source thread {}. Source summary: {}",
-            thread.id, summary
+    match source_name {
+        Some(name) => format!(
+            "Continue the work from source thread {}. Source name: {}",
+            thread.id, name
         ),
         None => format!("Continue the work from source thread {}.", thread.id),
     }
@@ -978,12 +1079,12 @@ async fn goal_objective_from_rollout_path(
         let RolloutItem::EventMsg(EventMsg::ThreadGoalUpdated(event)) = rollout_line.item else {
             continue;
         };
-        if event.goal.objective.trim().is_empty() {
+        let Some(objective) = meaningful_goal_objective(&event.goal.objective) else {
             continue;
-        }
+        };
         match pick {
-            HistoricalGoalPick::First => return Ok(Some(event.goal.objective)),
-            HistoricalGoalPick::Last => selected = Some(event.goal.objective),
+            HistoricalGoalPick::First => return Ok(Some(objective)),
+            HistoricalGoalPick::Last => selected = Some(objective),
         }
     }
     Ok(selected)
@@ -998,7 +1099,7 @@ async fn prepare_fresh_resume_startup(
     continuation_thread_id: ThreadId,
     extra_prompt: Option<&str>,
 ) -> color_eyre::Result<(String, String)> {
-    let objective =
+    let recovered_objective =
         recover_fresh_resume_objective(app_server, config, state_db, target_session, options)
             .await?;
     let handoff = prepare_fresh_resume_handoff(
@@ -1006,10 +1107,25 @@ async fn prepare_fresh_resume_startup(
         options,
         target_session,
         continuation_thread_id,
-        &objective,
+        &recovered_objective,
     )?;
-    let startup_prompt =
-        build_fresh_resume_prompt(target_session, &objective, &handoff, extra_prompt);
+    let objective = if options.context_in_first_message {
+        recovered_fresh_resume_goal_objective(target_session, &recovered_objective)
+    } else {
+        bounded_fresh_resume_goal_objective(target_session, &recovered_objective, &handoff)
+    };
+    let prompt_mode = if options.context_in_first_message {
+        FreshResumePromptMode::AcknowledgeOnly
+    } else {
+        FreshResumePromptMode::Continue
+    };
+    let startup_prompt = build_fresh_resume_prompt(
+        target_session,
+        &recovered_objective,
+        &handoff,
+        extra_prompt,
+        prompt_mode,
+    );
     Ok((objective, startup_prompt))
 }
 
@@ -1466,7 +1582,7 @@ pub async fn run_main(
 
 #[allow(clippy::too_many_arguments)]
 async fn run_ratatui_app(
-    mut cli: Cli,
+    cli: Cli,
     arg0_paths: Arg0DispatchPaths,
     loader_overrides: LoaderOverrides,
     app_server_target: AppServerTarget,
@@ -1930,7 +2046,7 @@ async fn run_ratatui_app(
         && trust_decision_was_made
         && WindowsSandboxLevel::from_config(&config) == WindowsSandboxLevel::Disabled;
 
-    let mut app_server = match app_server {
+    let app_server = match app_server {
         Some(app_server) => app_server,
         None => match start_app_server(
             &app_server_target,
@@ -1964,6 +2080,7 @@ async fn run_ratatui_app(
         }),
         _ => None,
     };
+    let auto_fresh_restart_on_repeated_errors = cli.auto_fresh_restart_on_repeated_errors;
 
     let Cli {
         prompt,
@@ -1989,6 +2106,7 @@ async fn run_ratatui_app(
         images,
         None,
         fresh_resume_startup,
+        auto_fresh_restart_on_repeated_errors,
         session_selection,
         feedback,
         should_show_trust_screen, // Proxy to: is it a first run in this directory?
@@ -2235,8 +2353,8 @@ mod tests {
             thread_id,
         };
         let handoff = FreshResumeHandoff {
-            status_file: Some(PathBuf::from(".codexx/sessions/continuation/STATUS.md")),
-            context_file: PathBuf::from(".codexx/sessions/continuation/RECOVERY_CONTEXT.md"),
+            status_file: Some(PathBuf::from(".codex/sessions/continuation/STATUS.md")),
+            context_file: PathBuf::from(".codex/sessions/continuation/RECOVERY_CONTEXT.md"),
         };
 
         let prompt = build_fresh_resume_prompt(
@@ -2244,15 +2362,116 @@ mod tests {
             "ship the fix",
             &handoff,
             Some("also run the focused tests"),
+            FreshResumePromptMode::Continue,
         );
 
         assert!(prompt.contains("fresh continuation, not a native session resume"));
         assert!(prompt.contains("Source thread: `123e4567-e89b-12d3-a456-426614174000`"));
         assert!(prompt.contains("Recovered goal:\nship the fix"));
         assert!(prompt.contains("Additional user instruction:\nalso run the focused tests"));
-        assert!(prompt.contains(".codexx/sessions/continuation/RECOVERY_CONTEXT.md"));
-        assert!(prompt.contains(".codexx/sessions/continuation/STATUS.md"));
+        assert!(prompt.contains(".codex/sessions/continuation/RECOVERY_CONTEXT.md"));
+        assert!(prompt.contains(".codex/sessions/continuation/STATUS.md"));
         assert!(prompt.contains("source rollout"));
+    }
+
+    #[test]
+    fn fresh_resume_ack_prompt_requests_acknowledge_without_continuing() {
+        let thread_id = ThreadId::from_string("123e4567-e89b-12d3-a456-426614174000").unwrap();
+        let target = crate::resume_picker::SessionTarget {
+            path: Some(PathBuf::from("source.jsonl")),
+            thread_id,
+        };
+        let handoff = FreshResumeHandoff {
+            status_file: Some(PathBuf::from(".codex/sessions/continuation/STATUS.md")),
+            context_file: PathBuf::from(".codex/sessions/continuation/RECOVERY_CONTEXT.md"),
+        };
+
+        let prompt = build_fresh_resume_prompt(
+            &target,
+            "ship the fix",
+            &handoff,
+            None,
+            FreshResumePromptMode::AcknowledgeOnly,
+        );
+
+        assert!(prompt.contains("Recovered goal:\nship the fix"));
+        assert!(prompt.contains(".codex/sessions/continuation/RECOVERY_CONTEXT.md"));
+        assert!(prompt.contains("reply exactly with `acknowledge`"));
+        assert!(!prompt.contains("Continue the recovered goal from here."));
+    }
+
+    #[test]
+    fn fresh_resume_goal_objective_is_bounded_and_points_to_context() {
+        let thread_id = ThreadId::from_string("123e4567-e89b-12d3-a456-426614174000").unwrap();
+        let target = crate::resume_picker::SessionTarget {
+            path: Some(PathBuf::from("source.jsonl")),
+            thread_id,
+        };
+        let handoff = FreshResumeHandoff {
+            status_file: Some(PathBuf::from(".codex/sessions/continuation/STATUS.md")),
+            context_file: PathBuf::from(".codex/sessions/continuation/RECOVERY_CONTEXT.md"),
+        };
+
+        let objective = bounded_fresh_resume_goal_objective(&target, "ship the fix", &handoff);
+
+        assert!(objective.contains("Recovered goal:\nship the fix"));
+        assert!(objective.contains(".codex/sessions/continuation/RECOVERY_CONTEXT.md"));
+        assert!(char_count(&objective) <= MAX_THREAD_GOAL_OBJECTIVE_CHARS);
+    }
+
+    #[test]
+    fn recovered_fresh_resume_goal_objective_omits_handoff_context() {
+        let thread_id = ThreadId::from_string("123e4567-e89b-12d3-a456-426614174000").unwrap();
+        let target = crate::resume_picker::SessionTarget {
+            path: Some(PathBuf::from("source.jsonl")),
+            thread_id,
+        };
+
+        let objective = recovered_fresh_resume_goal_objective(&target, "ship the fix");
+
+        assert_eq!(objective, "ship the fix");
+        assert!(!objective.contains("RECOVERY_CONTEXT.md"));
+    }
+
+    #[test]
+    fn recovered_fresh_resume_goal_objective_falls_back_when_too_long() {
+        let thread_id = ThreadId::from_string("123e4567-e89b-12d3-a456-426614174000").unwrap();
+        let target = crate::resume_picker::SessionTarget {
+            path: Some(PathBuf::from("source.jsonl")),
+            thread_id,
+        };
+
+        let objective = recovered_fresh_resume_goal_objective(
+            &target,
+            &"x".repeat(MAX_THREAD_GOAL_OBJECTIVE_CHARS + 1),
+        );
+
+        assert_eq!(
+            objective,
+            "Resume what you were doing in Codex session 123e4567-e89b-12d3-a456-426614174000."
+        );
+    }
+
+    #[test]
+    fn fresh_resume_goal_objective_uses_short_fallback_when_recovered_goal_is_too_long() {
+        let thread_id = ThreadId::from_string("123e4567-e89b-12d3-a456-426614174000").unwrap();
+        let target = crate::resume_picker::SessionTarget {
+            path: Some(PathBuf::from("source.jsonl")),
+            thread_id,
+        };
+        let handoff = FreshResumeHandoff {
+            status_file: Some(PathBuf::from(".codex/sessions/continuation/STATUS.md")),
+            context_file: PathBuf::from(".codex/sessions/continuation/RECOVERY_CONTEXT.md"),
+        };
+        let recovered = "x".repeat(MAX_THREAD_GOAL_OBJECTIVE_CHARS);
+
+        let objective = bounded_fresh_resume_goal_objective(&target, &recovered, &handoff);
+
+        assert!(objective.starts_with(
+            "Resume what you were doing in Codex session 123e4567-e89b-12d3-a456-426614174000."
+        ));
+        assert!(!objective.contains(&"x".repeat(80)));
+        assert!(char_count(&objective) <= MAX_THREAD_GOAL_OBJECTIVE_CHARS);
     }
 
     fn fallback_thread(name: Option<&str>, preview: &str) -> AppServerThread {
@@ -2284,7 +2503,7 @@ mod tests {
     }
 
     #[test]
-    fn fresh_resume_fallback_objective_uses_thread_title_or_preview() {
+    fn fresh_resume_fallback_objective_uses_thread_title_or_short_session_reference() {
         let named = fallback_fresh_resume_objective(&fallback_thread(
             Some("Saved continuation"),
             "older first message",
@@ -2293,7 +2512,10 @@ mod tests {
         assert!(!named.contains("older first message"));
 
         let preview = fallback_fresh_resume_objective(&fallback_thread(None, "ship the UI fix"));
-        assert!(preview.contains("ship the UI fix"));
+        assert_eq!(
+            preview,
+            "Continue the work from source thread 123e4567-e89b-12d3-a456-426614174000."
+        );
 
         let empty = fallback_fresh_resume_objective(&fallback_thread(None, "  "));
         assert_eq!(
@@ -2303,7 +2525,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn prepare_fresh_resume_handoff_uses_v6_continuation_dir_and_copies_status() {
+    async fn prepare_fresh_resume_handoff_uses_shared_continuation_dir_and_copies_status() {
         let codex_home = TempDir::new().expect("create temp codex home");
         let cwd = TempDir::new().expect("create temp cwd");
         let config = ConfigBuilder::default()
@@ -2326,7 +2548,7 @@ mod tests {
         };
         let source_status = cwd
             .path()
-            .join(".codexx")
+            .join(".codex")
             .join("sessions")
             .join("123e4567-e89b-12d3-a456-426614174000")
             .join("STATUS.md");
@@ -2345,7 +2567,7 @@ mod tests {
 
         let expected_dir = cwd
             .path()
-            .join(".codexx")
+            .join(".codex")
             .join("sessions")
             .join("223e4567-e89b-12d3-a456-426614174001");
         assert_eq!(handoff.status_file, Some(expected_dir.join("STATUS.md")));
@@ -2395,6 +2617,52 @@ mod tests {
                 .await
                 .expect("read last"),
             Some("last goal".to_string())
+        );
+    }
+
+    #[tokio::test]
+    async fn goal_objective_from_rollout_path_skips_generated_scaffolds() {
+        let dir = TempDir::new().expect("create temp dir");
+        let path = dir.path().join("rollout.jsonl");
+        let thread_id = ThreadId::from_string("123e4567-e89b-12d3-a456-426614174000").unwrap();
+        let generic = rollout_line_for_goal(
+            thread_id,
+            "Continue the active goal and ship the next useful improvement.",
+        );
+        let first = rollout_line_for_goal(thread_id, "first useful goal");
+        let short_reference = rollout_line_for_goal(
+            thread_id,
+            "Resume what you were doing in Codex session 123e4567-e89b-12d3-a456-426614174000.",
+        );
+        let recovered = rollout_line_for_goal(
+            thread_id,
+            "Continue the recovered goal from Codex session 123e4567-e89b-12d3-a456-426614174000.\n\n\
+Recovered goal:\nlast useful goal\n\n\
+Read the bounded context at `.codex/sessions/continuation/RECOVERY_CONTEXT.md` before continuing.",
+        );
+        std::fs::write(
+            &path,
+            format!(
+                "{}\n{}\n{}\n{}\n",
+                serde_json::to_string(&generic).expect("serialize generic"),
+                serde_json::to_string(&first).expect("serialize first"),
+                serde_json::to_string(&short_reference).expect("serialize short reference"),
+                serde_json::to_string(&recovered).expect("serialize recovered")
+            ),
+        )
+        .expect("write rollout");
+
+        assert_eq!(
+            goal_objective_from_rollout_path(&path, HistoricalGoalPick::First)
+                .await
+                .expect("read first"),
+            Some("first useful goal".to_string())
+        );
+        assert_eq!(
+            goal_objective_from_rollout_path(&path, HistoricalGoalPick::Last)
+                .await
+                .expect("read last"),
+            Some("last useful goal".to_string())
         );
     }
 

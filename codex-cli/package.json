@@ -4,10 +4,16 @@
   "license": "Apache-2.0",
   "bin": {
     "codexx": "bin/codex.js",
+    "codexxx": "bin/codex.js",
     "codex-v5": "bin/codex-v5.js",
     "codex-v6": "bin/codex-v6.js",
+    "codex-v7": "bin/codex-v7.js",
     "codexx-v5": "bin/codex-v5.js",
-    "codexx-v6": "bin/codex-v6.js"
+    "codexx-v6": "bin/codex-v6.js",
+    "codexx-v7": "bin/codex-v7.js"
+  },
+  "scripts": {
+    "postinstall": "node bin/patch-wsl-shims.js"
   },
   "type": "module",
   "engines": {

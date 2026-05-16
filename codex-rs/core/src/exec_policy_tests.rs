@@ -1856,12 +1856,42 @@ fn derive_requested_execpolicy_amendment_returns_none_for_shell_and_powershell_v
         vec!["/bin/bash".to_string(), "-lc".to_string()],
         vec!["/bin/zsh".to_string(), "-lc".to_string()],
         vec!["pwsh".to_string()],
+        vec![
+            "pwsh".to_string(),
+            "-NoProfile".to_string(),
+            "-Command".to_string(),
+        ],
+        vec![
+            "pwsh".to_string(),
+            "-NoProfile".to_string(),
+            "-c".to_string(),
+        ],
         vec!["pwsh".to_string(), "-Command".to_string()],
         vec!["pwsh".to_string(), "-c".to_string()],
         vec!["powershell".to_string()],
+        vec![
+            "powershell".to_string(),
+            "-NoProfile".to_string(),
+            "-Command".to_string(),
+        ],
+        vec![
+            "powershell".to_string(),
+            "-NoProfile".to_string(),
+            "-c".to_string(),
+        ],
         vec!["powershell".to_string(), "-Command".to_string()],
         vec!["powershell".to_string(), "-c".to_string()],
         vec!["powershell.exe".to_string()],
+        vec![
+            "powershell.exe".to_string(),
+            "-NoProfile".to_string(),
+            "-Command".to_string(),
+        ],
+        vec![
+            "powershell.exe".to_string(),
+            "-NoProfile".to_string(),
+            "-c".to_string(),
+        ],
         vec!["powershell.exe".to_string(), "-Command".to_string()],
         vec!["powershell.exe".to_string(), "-c".to_string()],
     ] {

@@ -33,6 +33,7 @@ use codex_app_server_protocol::AgentMessageDeltaNotification;
 use codex_app_server_protocol::AskForApproval;
 use codex_app_server_protocol::CommandExecutionRequestApprovalParams;
 use codex_app_server_protocol::ConfigWarningNotification;
+use codex_app_server_protocol::ErrorNotification;
 use codex_app_server_protocol::FileChangeRequestApprovalParams;
 use codex_app_server_protocol::FileUpdateChange;
 use codex_app_server_protocol::ItemStartedNotification;
@@ -3901,6 +3902,9 @@ async fn make_test_app() -> App {
         primary_thread_id: None,
         last_subagent_backfill_attempt: None,
         primary_session_configured: None,
+        auto_fresh_restart_on_repeated_errors: false,
+        auto_fresh_restart_on_repeated_errors_used: false,
+        auto_fresh_restart_error_streak: None,
         pending_primary_events: VecDeque::new(),
         pending_app_server_requests: PendingAppServerRequests::default(),
         pending_plugin_enabled_writes: HashMap::new(),
@@ -3964,6 +3968,9 @@ async fn make_test_app_with_channels() -> (
             primary_thread_id: None,
             last_subagent_backfill_attempt: None,
             primary_session_configured: None,
+            auto_fresh_restart_on_repeated_errors: false,
+            auto_fresh_restart_on_repeated_errors_used: false,
+            auto_fresh_restart_error_streak: None,
             pending_primary_events: VecDeque::new(),
             pending_app_server_requests: PendingAppServerRequests::default(),
             pending_plugin_enabled_writes: HashMap::new(),
@@ -4200,6 +4207,56 @@ fn turn_completed_notification(
             ..test_turn(turn_id, status, Vec::new())
         },
     })
+}
+
+const PURCHASE_CREDITS_USAGE_LIMIT_MESSAGE: &str = "You've hit your usage limit. Upgrade to Pro (https://chatgpt.com/explore/pro), visit https://chatgpt.com/codex/settings/usage to purchase more credits or try again";
+const REMOTE_COMPACT_ERROR_MESSAGE: &str =
+    "Error running remote compact task: remote compaction failed";
+
+fn app_server_turn_error(
+    message: &str,
+    codex_error_info: Option<AppServerCodexErrorInfo>,
+) -> AppServerTurnError {
+    AppServerTurnError {
+        message: message.to_string(),
+        codex_error_info,
+        additional_details: None,
+    }
+}
+
+fn error_notification_event(
+    thread_id: ThreadId,
+    message: &str,
+    will_retry: bool,
+) -> ThreadBufferedEvent {
+    error_notification_event_with_info(thread_id, message, will_retry, None)
+}
+
+fn error_notification_event_with_info(
+    thread_id: ThreadId,
+    message: &str,
+    will_retry: bool,
+    codex_error_info: Option<AppServerCodexErrorInfo>,
+) -> ThreadBufferedEvent {
+    ThreadBufferedEvent::Notification(ServerNotification::Error(ErrorNotification {
+        error: app_server_turn_error(message, codex_error_info),
+        will_retry,
+        thread_id: thread_id.to_string(),
+        turn_id: "turn-1".to_string(),
+    }))
+}
+
+fn completed_turn_event(thread_id: ThreadId) -> ThreadBufferedEvent {
+    ThreadBufferedEvent::Notification(ServerNotification::TurnCompleted(
+        TurnCompletedNotification {
+            thread_id: thread_id.to_string(),
+            turn: Turn {
+                completed_at: Some(0),
+                duration_ms: Some(1),
+                ..test_turn("turn-1", TurnStatus::Completed, Vec::new())
+            },
+        },
+    ))
 }
 
 fn thread_closed_notification(thread_id: ThreadId) -> ServerNotification {
@@ -4439,6 +4496,244 @@ fn active_turn_not_steerable_turn_error_extracts_structured_server_error() {
     assert_eq!(
         active_turn_not_steerable_turn_error(&error),
         Some(turn_error)
+    );
+}
+
+#[test]
+fn repeated_error_recovery_key_groups_main_error_families() {
+    assert_eq!(
+        App::repeated_error_recovery_key(REMOTE_COMPACT_ERROR_MESSAGE),
+        "Error running remote compact task"
+    );
+    assert_eq!(
+        App::repeated_error_recovery_key(PURCHASE_CREDITS_USAGE_LIMIT_MESSAGE),
+        "You've hit your usage limit"
+    );
+    assert_eq!(
+        App::repeated_error_recovery_key("different backend error"),
+        "different backend error"
+    );
+}
+
+#[tokio::test]
+async fn auto_fresh_restart_repeated_error_source_recovers_immediately_from_compact_errors() {
+    let mut app = make_test_app().await;
+    let thread_id = ThreadId::new();
+    app.primary_thread_id = Some(thread_id);
+    app.active_thread_id = Some(thread_id);
+    let event = error_notification_event(thread_id, REMOTE_COMPACT_ERROR_MESSAGE, false);
+
+    assert_eq!(app.auto_fresh_restart_repeated_error_source(&event), None);
+
+    app.auto_fresh_restart_on_repeated_errors = true;
+    let source = app
+        .auto_fresh_restart_repeated_error_source(&event)
+        .expect("first terminal remote compact error should recover");
+    assert_eq!(source.0, thread_id);
+    assert_eq!(source.1, REMOTE_COMPACT_ERROR_MESSAGE);
+
+    app.auto_fresh_restart_on_repeated_errors_used = true;
+    assert_eq!(app.auto_fresh_restart_repeated_error_source(&event), None);
+}
+
+#[tokio::test]
+async fn auto_fresh_restart_repeated_error_source_uses_repeated_threshold_for_retrying_compact_errors()
+ {
+    let mut app = make_test_app().await;
+    let thread_id = ThreadId::new();
+    app.primary_thread_id = Some(thread_id);
+    app.active_thread_id = Some(thread_id);
+    app.auto_fresh_restart_on_repeated_errors = true;
+
+    let event = error_notification_event(thread_id, REMOTE_COMPACT_ERROR_MESSAGE, true);
+
+    assert_eq!(app.auto_fresh_restart_repeated_error_source(&event), None);
+    assert_eq!(app.auto_fresh_restart_repeated_error_source(&event), None);
+    assert!(
+        app.auto_fresh_restart_repeated_error_source(&event)
+            .is_some()
+    );
+}
+
+#[tokio::test]
+async fn auto_fresh_restart_repeated_error_source_recovers_immediately_from_context_errors() {
+    let mut app = make_test_app().await;
+    let thread_id = ThreadId::new();
+    app.primary_thread_id = Some(thread_id);
+    app.active_thread_id = Some(thread_id);
+    app.auto_fresh_restart_on_repeated_errors = true;
+
+    let event = error_notification_event_with_info(
+        thread_id,
+        "context window exceeded",
+        false,
+        Some(AppServerCodexErrorInfo::ContextWindowExceeded),
+    );
+
+    let source = app
+        .auto_fresh_restart_repeated_error_source(&event)
+        .expect("first terminal context error should recover");
+    assert_eq!(source.0, thread_id);
+    assert_eq!(source.1, "context window exceeded");
+}
+
+#[tokio::test]
+async fn auto_fresh_restart_repeated_error_source_requires_three_generic_messages() {
+    let mut app = make_test_app().await;
+    let thread_id = ThreadId::new();
+    app.primary_thread_id = Some(thread_id);
+    app.active_thread_id = Some(thread_id);
+    let event = error_notification_event(thread_id, "different backend error", false);
+
+    assert_eq!(app.auto_fresh_restart_repeated_error_source(&event), None);
+
+    app.auto_fresh_restart_on_repeated_errors = true;
+    assert_eq!(app.auto_fresh_restart_repeated_error_source(&event), None);
+    assert_eq!(app.auto_fresh_restart_repeated_error_source(&event), None);
+    let source = app
+        .auto_fresh_restart_repeated_error_source(&event)
+        .expect("third consecutive matching error should recover");
+    assert_eq!(source.0, thread_id);
+    assert_eq!(source.1, "different backend error");
+
+    app.auto_fresh_restart_on_repeated_errors_used = true;
+    assert_eq!(app.auto_fresh_restart_repeated_error_source(&event), None);
+}
+
+#[tokio::test]
+async fn auto_fresh_restart_repeated_error_source_restarts_after_three_usage_limit_warnings() {
+    let mut app = make_test_app().await;
+    let thread_id = ThreadId::new();
+    app.primary_thread_id = Some(thread_id);
+    app.active_thread_id = Some(thread_id);
+    app.auto_fresh_restart_on_repeated_errors = true;
+
+    let event = error_notification_event(thread_id, PURCHASE_CREDITS_USAGE_LIMIT_MESSAGE, true);
+
+    assert_eq!(app.auto_fresh_restart_repeated_error_source(&event), None);
+    assert_eq!(app.auto_fresh_restart_repeated_error_source(&event), None);
+    assert!(
+        app.auto_fresh_restart_repeated_error_source(&event)
+            .is_some()
+    );
+}
+
+#[tokio::test]
+async fn auto_fresh_restart_repeated_error_source_resets_generic_streak_on_progress() {
+    let mut app = make_test_app().await;
+    let thread_id = ThreadId::new();
+    app.primary_thread_id = Some(thread_id);
+    app.active_thread_id = Some(thread_id);
+    app.auto_fresh_restart_on_repeated_errors = true;
+
+    let error_event = error_notification_event(thread_id, "different backend error", false);
+    let progress_event = ThreadBufferedEvent::Notification(agent_message_delta_notification(
+        thread_id,
+        "turn-1",
+        "item-1",
+        "still making progress",
+    ));
+
+    assert_eq!(
+        app.auto_fresh_restart_repeated_error_source(&error_event),
+        None
+    );
+    assert_eq!(
+        app.auto_fresh_restart_repeated_error_source(&error_event),
+        None
+    );
+    assert_eq!(
+        app.auto_fresh_restart_repeated_error_source(&progress_event),
+        None
+    );
+    assert_eq!(
+        app.auto_fresh_restart_repeated_error_source(&error_event),
+        None
+    );
+    assert_eq!(
+        app.auto_fresh_restart_repeated_error_source(&error_event),
+        None
+    );
+    assert!(
+        app.auto_fresh_restart_repeated_error_source(&error_event)
+            .is_some()
+    );
+}
+
+#[tokio::test]
+async fn auto_fresh_restart_repeated_error_source_restarts_after_three_generic_errors() {
+    let mut app = make_test_app().await;
+    let thread_id = ThreadId::new();
+    app.primary_thread_id = Some(thread_id);
+    app.active_thread_id = Some(thread_id);
+    app.auto_fresh_restart_on_repeated_errors = true;
+
+    let event = error_notification_event(thread_id, "different backend error", false);
+
+    assert_eq!(app.auto_fresh_restart_repeated_error_source(&event), None);
+    assert_eq!(app.auto_fresh_restart_repeated_error_source(&event), None);
+    assert!(
+        app.auto_fresh_restart_repeated_error_source(&event)
+            .is_some()
+    );
+}
+
+#[tokio::test]
+async fn auto_fresh_restart_repeated_error_source_resets_on_different_error_and_success() {
+    let mut app = make_test_app().await;
+    let thread_id = ThreadId::new();
+    app.primary_thread_id = Some(thread_id);
+    app.active_thread_id = Some(thread_id);
+    app.auto_fresh_restart_on_repeated_errors = true;
+
+    let usage_event =
+        error_notification_event(thread_id, PURCHASE_CREDITS_USAGE_LIMIT_MESSAGE, true);
+    let other_event = error_notification_event(thread_id, "different backend error", false);
+
+    assert_eq!(
+        app.auto_fresh_restart_repeated_error_source(&usage_event),
+        None
+    );
+    assert_eq!(
+        app.auto_fresh_restart_repeated_error_source(&usage_event),
+        None
+    );
+    assert_eq!(
+        app.auto_fresh_restart_repeated_error_source(&other_event),
+        None
+    );
+    assert_eq!(
+        app.auto_fresh_restart_repeated_error_source(&usage_event),
+        None
+    );
+    assert_eq!(
+        app.auto_fresh_restart_repeated_error_source(&usage_event),
+        None
+    );
+    assert!(
+        app.auto_fresh_restart_repeated_error_source(&usage_event)
+            .is_some()
+    );
+
+    let mut app = make_test_app().await;
+    app.primary_thread_id = Some(thread_id);
+    app.active_thread_id = Some(thread_id);
+    app.auto_fresh_restart_on_repeated_errors = true;
+    assert_eq!(
+        app.auto_fresh_restart_repeated_error_source(&usage_event),
+        None
+    );
+    assert_eq!(
+        app.auto_fresh_restart_repeated_error_source(&usage_event),
+        None
+    );
+    assert_eq!(
+        app.auto_fresh_restart_repeated_error_source(&completed_turn_event(thread_id)),
+        None
+    );
+    assert_eq!(
+        app.auto_fresh_restart_repeated_error_source(&usage_event),
+        None
     );
 }
 
@@ -5331,7 +5626,17 @@ async fn session_summary_includes_resume_hint_for_persisted_rollout() {
     );
     assert_eq!(
         summary.resume_command,
-        Some("codexx resume 123e4567-e89b-12d3-a456-426614174000".to_string())
+        Some("codex resume 123e4567-e89b-12d3-a456-426614174000".to_string())
+    );
+}
+
+#[test]
+fn previous_session_before_restart_message_includes_resume_command() {
+    let conversation = ThreadId::from_string("123e4567-e89b-12d3-a456-426614174000").unwrap();
+
+    assert_eq!(
+        previous_session_before_restart_message(conversation),
+        "Previous session before fresh restart: codex resume 123e4567-e89b-12d3-a456-426614174000"
     );
 }
 
@@ -5357,6 +5662,6 @@ async fn session_summary_uses_id_even_when_thread_has_name() {
     .expect("summary");
     assert_eq!(
         summary.resume_command,
-        Some("codexx resume 123e4567-e89b-12d3-a456-426614174000".to_string())
+        Some("codex resume 123e4567-e89b-12d3-a456-426614174000".to_string())
     );
 }
