@@ -2,7 +2,7 @@ param(
     [Parameter(Mandatory = $true)]
     [string]$ReleaseTag,
 
-    [string]$UpstreamRemote = "origin",
+    [string]$UpstreamRemote = "openai",
 
     [string]$PatchRef = "codexx-goal-profiles-rust-v0.130.0",
 

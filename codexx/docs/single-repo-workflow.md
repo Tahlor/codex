@@ -7,7 +7,7 @@ Codexx should be one Git checkout, not a wrapper repo containing another repo.
 Use this as the only Codexx source checkout:
 
 ```powershell
-gitt clone -b codexx-goal-profiles-rust-v0.130.0 git@github.com:Tahlor/codex.git C:\Users\tarchibald\github\codexx
+gitt clone -o codexx -b codexx-goal-profiles-rust-v0.130.0 git@github.com:Tahlor/codex.git C:\Users\tarchibald\github\codexx
 Set-Location C:\Users\tarchibald\github\codexx
 ```
 
@@ -19,7 +19,8 @@ subdirectory. The OpenAI project is tracked as a remote, not as a nested folder.
 
 ## Expected Remotes
 
-For a fresh clone from `Tahlor/codex`, `origin` should be your Codexx fork:
+The Codexx fork remote should be named `codexx`, and OpenAI's upstream source
+remote should be named `openai`:
 
 ```powershell
 gitt remote -v
@@ -35,7 +36,7 @@ gitt fetch openai --tags
 Expected shape:
 
 ```text
-origin  git@github.com:Tahlor/codex.git
+codexx  git@github.com:Tahlor/codex.git
 openai  git@github.com:openai/codex.git
 ```
 
@@ -65,7 +66,7 @@ Example for a future `rust-v0.131.0` release:
 ```powershell
 Set-Location C:\Users\tarchibald\github\codexx
 gitt status --short
-gitt fetch origin
+gitt fetch codexx
 gitt fetch openai --tags
 
 .\codexx\scripts\merge-openai-release.ps1 `
@@ -121,7 +122,7 @@ Set-Location C:\Users\tarchibald\github\codexx
 gitt status --short
 gitt add -A
 gitt commit -m "Forward-port codexx to rust-v0.131.0"
-gitt push -u origin codexx-goal-profiles-rust-v0.131.0
+gitt push -u codexx codexx-goal-profiles-rust-v0.131.0
 ```
 
 ## Release Install Later
