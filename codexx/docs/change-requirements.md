@@ -66,7 +66,7 @@ Changed artifacts:
 
 Acceptance evidence:
 
-- npm `bin` maps only the five Codexx commands above.
+- npm `bin` maps only the eight Codexx commands above.
 - Unix and Windows installers expose the same primary and alias commands.
 - release completeness checks require all alias binaries.
 
@@ -516,11 +516,11 @@ command set, platform payloads, and publication checklist.
 
 Changed artifacts:
 
-- `docs/codexx-release-and-merge.md`
+- `codexx/docs/release-and-merge.md`
 
 Acceptance evidence:
 
-- release notes list the package name and five installed commands.
+- release notes list the package name and eight installed commands.
 - release checklist names the expected npm bin map.
 - release notes document Codexx platform payload aliases.
 
@@ -531,8 +531,8 @@ upstream tag and provide actionable conflict guidance.
 
 Changed artifacts:
 
-- `scripts/merge-codexx-release.ps1`
-- `docs/codexx-release-and-merge.md`
+- `codexx/scripts/merge-openai-release.ps1`
+- `codexx/docs/release-and-merge.md`
 
 Acceptance evidence:
 
@@ -553,7 +553,7 @@ lockfile version metadata rather than forcing stale version values forward.
 Changed artifacts:
 
 - `codex-rs/Cargo.lock`
-- `docs/codexx-release-and-merge.md`
+- `codexx/docs/release-and-merge.md`
 
 Acceptance evidence:
 
@@ -593,7 +593,7 @@ node --check codex-cli\bin\codex-v6.js
 node --check codex-cli\bin\codex-v7.js
 ```
 
-The merge checklist in `docs/codexx-release-and-merge.md` intentionally repeats
+The merge checklist in `codexx/docs/release-and-merge.md` intentionally repeats
 these commands so release validation and change validation stay aligned.
 
 ## Change Map
@@ -621,6 +621,6 @@ these commands so release validation and change validation stay aligned.
   `codex-rs/tui/src/update_action.rs`, `codex-rs/tui/src/update_prompt.rs`,
   `codex-rs/tui/src/updates.rs`, `codex-rs/tui/tooltips.txt`.
 - Release maintenance:
-  `READ_THIS_CODEXX_CHANGE_REQUIREMENTS.md`,
-  `docs/codexx-release-and-merge.md`, `scripts/merge-codexx-release.ps1`,
+  `codexx/docs/change-requirements.md`,
+  `codexx/docs/release-and-merge.md`, `codexx/scripts/merge-openai-release.ps1`,
   `codex-rs/Cargo.lock`.

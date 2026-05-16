@@ -68,7 +68,7 @@ gitt status --short
 gitt fetch origin
 gitt fetch openai --tags
 
-.\scripts\merge-codexx-release.ps1 `
+.\codexx\scripts\merge-openai-release.ps1 `
   -ReleaseTag rust-v0.131.0 `
   -UpstreamRemote openai `
   -BaseTag rust-v0.130.0 `
@@ -78,6 +78,8 @@ gitt fetch openai --tags
 
 The helper creates the work branch from the new OpenAI release tag and
 cherry-picks the Codexx patch range `rust-v0.130.0..codexx-goal-profiles-rust-v0.130.0`.
+It defaults to the local `gitt` wrapper. On machines that intentionally use
+stock Git, pass `-GitCommand git`.
 
 If conflicts occur:
 

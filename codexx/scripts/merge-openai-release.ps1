@@ -12,30 +12,42 @@ param(
 
     [string]$WorkBranch,
 
+    [string]$GitCommand,
+
     [switch]$NoFetch
 )
 
 Set-StrictMode -Version Latest
 $ErrorActionPreference = "Stop"
 
+if ([string]::IsNullOrWhiteSpace($GitCommand)) {
+    if (Get-Command gitt -ErrorAction SilentlyContinue) {
+        $GitCommand = "gitt"
+    } else {
+        throw "Git wrapper 'gitt' was not found. Pass -GitCommand git only on machines that intentionally use stock Git."
+    }
+} elseif (-not (Get-Command $GitCommand -ErrorAction SilentlyContinue)) {
+    throw "Git command '$GitCommand' was not found."
+}
+
 function Run-Git {
     param([string[]]$GitArgs)
-    Write-Host "+ git $($GitArgs -join ' ')"
-    & git @GitArgs
+    Write-Host "+ $GitCommand $($GitArgs -join ' ')"
+    & $GitCommand @GitArgs
     if ($LASTEXITCODE -ne 0) {
-        throw "git $($GitArgs -join ' ') failed with exit code $LASTEXITCODE"
+        throw "$GitCommand $($GitArgs -join ' ') failed with exit code $LASTEXITCODE"
     }
 }
 
 function Invoke-Git {
     param([string[]]$GitArgs)
-    Write-Host "+ git $($GitArgs -join ' ')"
-    & git @GitArgs
+    Write-Host "+ $GitCommand $($GitArgs -join ' ')"
+    & $GitCommand @GitArgs
 }
 
 function Test-GitCommit {
     param([string]$Ref)
-    & git rev-parse --verify --quiet "$Ref^{commit}" *> $null
+    & $GitCommand rev-parse --verify --quiet "$Ref^{commit}" *> $null
     return $LASTEXITCODE -eq 0
 }
 
@@ -51,7 +63,7 @@ if ([string]::IsNullOrWhiteSpace($PatchRange)) {
     $PatchRange = "$BaseTag..$PatchRef"
 }
 
-$dirty = (& git status --porcelain)
+$dirty = (& $GitCommand status --porcelain)
 if (-not [string]::IsNullOrWhiteSpace($dirty)) {
     throw "Working tree is dirty. Commit or stash changes before merging a new release."
 }
@@ -71,7 +83,7 @@ if (-not (Test-GitCommit $PatchRef)) {
     throw "Patch ref '$PatchRef' was not found."
 }
 
-$patchCount = (& git rev-list --count $PatchRange).Trim()
+$patchCount = (& $GitCommand rev-list --count $PatchRange).Trim()
 if ($LASTEXITCODE -ne 0) {
     throw "Patch range '$PatchRange' is not valid."
 }
@@ -93,15 +105,15 @@ $cherryPickExit = $LASTEXITCODE
 if ($cherryPickExit -ne 0) {
     Write-Host ""
     Write-Warning "Codexx patch range did not apply cleanly."
-    $conflicts = @(& git diff --name-only --diff-filter=U)
+    $conflicts = @(& $GitCommand diff --name-only --diff-filter=U)
     if ($conflicts.Count -gt 0) {
         Write-Host "Conflicted files:"
         $conflicts | ForEach-Object { Write-Host "  $_" }
     }
     Write-Host ""
-    Write-Host "Resolve conflicts, run 'git add <files>', then 'git cherry-pick --continue'."
-    Write-Host "To abandon this attempt, run 'git cherry-pick --abort'."
-    throw "git cherry-pick failed with exit code $cherryPickExit"
+    Write-Host "Resolve conflicts, run '$GitCommand add <files>', then '$GitCommand cherry-pick --continue'."
+    Write-Host "To abandon this attempt, run '$GitCommand cherry-pick --abort'."
+    throw "$GitCommand cherry-pick failed with exit code $cherryPickExit"
 }
 
 Write-Host ""

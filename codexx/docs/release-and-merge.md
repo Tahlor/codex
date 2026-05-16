@@ -15,12 +15,11 @@ sessions and generated handoff files stay on the standard `CODEX_HOME` /
 threads created through the Codexx aliases.
 
 For a requirements-level inventory of the forked behavior and changed files,
-read the root-level
-[READ_THIS_CODEXX_CHANGE_REQUIREMENTS.md](../READ_THIS_CODEXX_CHANGE_REQUIREMENTS.md).
+read [Codexx change requirements](./change-requirements.md).
 
 For the local checkout layout, clone and work in one repository only. Do not use
 `codex-openai-fork` with a nested `upstream` folder. See
-[Codexx single-repo workflow](./codexx-single-repo-workflow.md).
+[Codexx single-repo workflow](./single-repo-workflow.md).
 
 ## Precompiled Platforms
 
@@ -86,7 +85,7 @@ gitt fetch openai --tags
 Then run:
 
 ```powershell
-.\scripts\merge-codexx-release.ps1 `
+.\codexx\scripts\merge-openai-release.ps1 `
   -ReleaseTag rust-v0.131.0 `
   -UpstreamRemote openai `
   -BaseTag rust-v0.130.0 `
@@ -96,7 +95,10 @@ Then run:
 
 The helper fetches upstream tags, creates the requested work branch, and
 cherry-picks the Codexx patch range with `rerere` enabled and Git's
-renormalizing merge strategy. Resolve conflicts if any, then run:
+renormalizing merge strategy. It defaults to the local `gitt` wrapper. On
+machines that intentionally use stock Git, pass `-GitCommand git`.
+
+Resolve conflicts if any, then run:
 
 ```powershell
 cargo check -p codex-cli --bin codex --message-format short
