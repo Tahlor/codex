@@ -78,6 +78,12 @@ use codex_protocol::config_types::Settings;
 use codex_protocol::models::FileSystemPermissions;
 use codex_protocol::models::NetworkPermissions;
 use codex_protocol::models::PermissionProfile;
+use codex_protocol::protocol::EventMsg;
+use codex_protocol::protocol::RolloutItem;
+use codex_protocol::protocol::RolloutLine;
+use codex_protocol::protocol::ThreadGoal;
+use codex_protocol::protocol::ThreadGoalStatus as CoreThreadGoalStatus;
+use codex_protocol::protocol::ThreadGoalUpdatedEvent;
 use codex_protocol::request_permissions::RequestPermissionProfile;
 use codex_protocol::user_input::TextElement;
 use codex_utils_absolute_path::AbsolutePathBuf;
@@ -4259,6 +4265,26 @@ fn completed_turn_event(thread_id: ThreadId) -> ThreadBufferedEvent {
     ))
 }
 
+fn rollout_line_for_goal(thread_id: ThreadId, objective: &str) -> RolloutLine {
+    RolloutLine {
+        timestamp: "2026-01-01T00:00:00.000Z".to_string(),
+        item: RolloutItem::EventMsg(EventMsg::ThreadGoalUpdated(ThreadGoalUpdatedEvent {
+            thread_id: thread_id.clone(),
+            turn_id: None,
+            goal: ThreadGoal {
+                thread_id,
+                objective: objective.to_string(),
+                status: CoreThreadGoalStatus::Active,
+                token_budget: None,
+                tokens_used: 0,
+                time_used_seconds: 0,
+                created_at: 0,
+                updated_at: 0,
+            },
+        })),
+    }
+}
+
 fn thread_closed_notification(thread_id: ThreadId) -> ServerNotification {
     ServerNotification::ThreadClosed(ThreadClosedNotification {
         thread_id: thread_id.to_string(),
@@ -4534,6 +4560,134 @@ async fn auto_fresh_restart_repeated_error_source_recovers_immediately_from_comp
 
     app.auto_fresh_restart_on_repeated_errors_used = true;
     assert_eq!(app.auto_fresh_restart_repeated_error_source(&event), None);
+}
+
+#[test]
+fn auto_fresh_restart_compact_error_starts_fresh_interactive_session() -> Result<()> {
+    // The embedded app-server futures need extra stack in Windows debug test builds.
+    std::thread::Builder::new()
+        .name("auto-fresh-compact-error".to_string())
+        .stack_size(16 * 1024 * 1024)
+        .spawn(|| {
+            let runtime = tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()?;
+            runtime.block_on(Box::pin(async {
+                let temp_dir = tempdir()?;
+                let project_cwd = temp_dir.path().join("project");
+                std::fs::create_dir_all(&project_cwd)?;
+                let config = ConfigBuilder::default()
+                    .codex_home(temp_dir.path().join("codex-home"))
+                    .harness_overrides(ConfigOverrides {
+                        cwd: Some(project_cwd.clone()),
+                        ..Default::default()
+                    })
+                    .build()
+                    .await?;
+
+                let (mut app, mut app_event_rx, _op_rx) = make_test_app_with_channels().await;
+                app.config = config.clone();
+                app.file_search.update_search_dir(config.cwd.to_path_buf());
+                let mut app_server =
+                    Box::pin(crate::start_embedded_app_server_for_picker(&config)).await?;
+                let source_started = app_server.start_thread(&config).await?;
+                let source_thread_id = source_started.session.thread_id;
+                let source_rollout_path = source_started
+                    .session
+                    .rollout_path
+                    .clone()
+                    .expect("source session should have a rollout path");
+                std::fs::create_dir_all(
+                    source_rollout_path
+                        .parent()
+                        .expect("source rollout path should have parent directory"),
+                )?;
+                std::fs::write(
+                    &source_rollout_path,
+                    format!(
+                        "{}\n",
+                        serde_json::to_string(&rollout_line_for_goal(
+                            source_thread_id,
+                            "finish the existing goal",
+                        ))?
+                    ),
+                )?;
+                app.enqueue_primary_thread_session(source_started.session, source_started.turns)
+                    .await?;
+                while app_event_rx.try_recv().is_ok() {}
+
+                app.auto_fresh_restart_on_repeated_errors = true;
+                let event =
+                    error_notification_event(source_thread_id, REMOTE_COMPACT_ERROR_MESSAGE, false);
+                let repeated_error_restart = app.auto_fresh_restart_repeated_error_source(&event);
+                app.handle_thread_event_now(event);
+                app.maybe_start_fresh_session_from_repeated_error_recovery(
+                    &mut app_server,
+                    repeated_error_restart,
+                    crate::tui::FrameRequester::test_dummy(),
+                )
+                .await;
+
+                let fresh_thread_id = app
+                    .chat_widget
+                    .thread_id()
+                    .expect("recovery should attach a fresh primary thread");
+                assert_ne!(fresh_thread_id, source_thread_id);
+                assert_eq!(app.primary_thread_id, Some(fresh_thread_id));
+                assert_eq!(app.active_thread_id, Some(fresh_thread_id));
+                assert!(app.thread_event_channels.contains_key(&fresh_thread_id));
+                assert!(!app.thread_event_channels.contains_key(&source_thread_id));
+                assert!(app.auto_fresh_restart_on_repeated_errors_used);
+
+                let context_file = app
+                    .config
+                    .cwd
+                    .as_path()
+                    .join(".codex")
+                    .join("sessions")
+                    .join(fresh_thread_id.to_string())
+                    .join("RECOVERY_CONTEXT.md");
+                let context = std::fs::read_to_string(&context_file)?;
+                assert!(context.contains("Continuation thread:"));
+                assert!(context.contains("Source thread:"));
+                assert!(context.contains("Recovered goal:\nfinish the existing goal"));
+
+                let mut submitted_user_turn = None;
+                while let Ok(event) = app_event_rx.try_recv() {
+                    match event {
+                        AppEvent::SubmitThreadOp {
+                            thread_id,
+                            op: Op::UserTurn { items, .. },
+                        } => {
+                            submitted_user_turn = Some((thread_id, items));
+                        }
+                        AppEvent::CodexOp(Op::UserTurn { items, .. }) => {
+                            submitted_user_turn = Some((fresh_thread_id, items));
+                        }
+                        _ => {}
+                    }
+                }
+                let (submitted_thread_id, items) = submitted_user_turn
+                    .expect("fresh interactive session should submit startup prompt");
+                assert_eq!(submitted_thread_id, fresh_thread_id);
+                let submitted_text = items
+                    .iter()
+                    .find_map(|item| match item {
+                        UserInput::Text { text, .. } => Some(text.as_str()),
+                        _ => None,
+                    })
+                    .expect("startup prompt should be a text user input");
+                assert!(submitted_text.contains("fresh continuation"));
+                assert!(submitted_text.contains("Read the bounded context"));
+                assert!(submitted_text.contains(REMOTE_COMPACT_ERROR_MESSAGE));
+
+                app_server.shutdown().await?;
+                Ok(())
+            }))
+        })
+        .expect("compact error recovery test thread should spawn")
+        .join()
+        .unwrap_or_else(|panic| std::panic::resume_unwind(panic))
 }
 
 #[tokio::test]

@@ -136,7 +136,7 @@ impl App {
         if let Some(thread_id) = self.chat_widget.thread_id() {
             // Clear any in-flight rollback guard when switching threads.
             self.backtrack.pending_rollback = None;
-            if let Err(err) = app_server.thread_unsubscribe(thread_id).await {
+            if let Err(err) = Box::pin(app_server.thread_unsubscribe(thread_id)).await {
                 tracing::warn!("failed to unsubscribe thread {thread_id}: {err}");
             }
             self.abort_thread_event_listener(thread_id);
@@ -1612,5 +1612,25 @@ impl App {
             tui.frame_requester().schedule_frame();
         }
         Ok(())
+    }
+
+    #[cfg(test)]
+    pub(super) async fn maybe_start_fresh_session_from_repeated_error_recovery(
+        &mut self,
+        app_server: &mut AppServerSession,
+        repeated_error_restart: Option<(ThreadId, String)>,
+        frame_requester: tui::FrameRequester,
+    ) {
+        if let Some((source_thread_id, error_message)) = repeated_error_restart {
+            self.auto_fresh_restart_on_repeated_errors_used = true;
+            self.start_fresh_session_from_repeated_error_recovery_with_frame_requester(
+                app_server,
+                source_thread_id,
+                error_message,
+                frame_requester,
+                /*unsubscribe_old_thread*/ false,
+            )
+            .await;
+        }
     }
 }

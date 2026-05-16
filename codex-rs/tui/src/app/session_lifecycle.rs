@@ -498,6 +498,25 @@ impl App {
         error_message: String,
     ) {
         print_previous_session_before_restart(tui, source_thread_id).await;
+        let frame_requester = tui.frame_requester();
+        self.start_fresh_session_from_repeated_error_recovery_with_frame_requester(
+            app_server,
+            source_thread_id,
+            error_message,
+            frame_requester,
+            /*unsubscribe_old_thread*/ true,
+        )
+        .await;
+    }
+
+    pub(super) async fn start_fresh_session_from_repeated_error_recovery_with_frame_requester(
+        &mut self,
+        app_server: &mut AppServerSession,
+        source_thread_id: ThreadId,
+        error_message: String,
+        frame_requester: tui::FrameRequester,
+        unsubscribe_old_thread: bool,
+    ) {
         self.refresh_in_memory_config_from_disk_best_effort("recovering from repeated errors")
             .await;
 
@@ -537,7 +556,7 @@ impl App {
                     "Failed to start a fresh session after repeated errors: {err}"
                 ));
                 self.config.model = Some(model);
-                tui.frame_requester().schedule_frame();
+                frame_requester.schedule_frame();
                 return;
             }
         };
@@ -556,7 +575,8 @@ impl App {
             Ok(startup) => startup,
             Err(err) => {
                 let started_thread_id = started.session.thread_id;
-                if let Err(unsubscribe_err) = app_server.thread_unsubscribe(started_thread_id).await
+                if let Err(unsubscribe_err) =
+                    Box::pin(app_server.thread_unsubscribe(started_thread_id)).await
                 {
                     tracing::warn!(
                         "failed to unsubscribe unused recovery thread {started_thread_id}: {unsubscribe_err}"
@@ -566,7 +586,7 @@ impl App {
                     "Failed to prepare repeated-error recovery handoff: {err}"
                 ));
                 self.config.model = Some(model);
-                tui.frame_requester().schedule_frame();
+                frame_requester.schedule_frame();
                 return;
             }
         };
@@ -592,25 +612,29 @@ impl App {
             Vec::new(),
         );
 
-        self.shutdown_current_thread(app_server).await;
+        if unsubscribe_old_thread {
+            Box::pin(self.shutdown_current_thread(app_server)).await;
+        }
         let tracked_thread_ids: Vec<ThreadId> =
             self.thread_event_channels.keys().copied().collect();
-        for thread_id in tracked_thread_ids {
-            if thread_id == started_thread_id {
-                continue;
-            }
-            if let Err(err) = app_server.thread_unsubscribe(thread_id).await {
-                tracing::warn!("failed to unsubscribe tracked thread {thread_id}: {err}");
+        if unsubscribe_old_thread {
+            for thread_id in tracked_thread_ids {
+                if thread_id == started_thread_id {
+                    continue;
+                }
+                if let Err(err) = Box::pin(app_server.thread_unsubscribe(thread_id)).await {
+                    tracing::warn!("failed to unsubscribe tracked thread {thread_id}: {err}");
+                }
             }
         }
 
         self.config = config.clone();
         match self
-            .replace_chat_widget_with_app_server_thread(
-                tui,
+            .replace_chat_widget_with_app_server_thread_with_frame_requester(
                 app_server,
                 started,
                 initial_user_message,
+                frame_requester.clone(),
             )
             .await
         {
@@ -639,7 +663,7 @@ impl App {
             }
         }
 
-        tui.frame_requester().schedule_frame();
+        frame_requester.schedule_frame();
     }
 
     pub(super) async fn replace_chat_widget_with_app_server_thread(
@@ -649,12 +673,28 @@ impl App {
         started: AppServerStartedThread,
         initial_user_message: Option<crate::chatwidget::UserMessage>,
     ) -> Result<()> {
+        self.replace_chat_widget_with_app_server_thread_with_frame_requester(
+            app_server,
+            started,
+            initial_user_message,
+            tui.frame_requester(),
+        )
+        .await
+    }
+
+    pub(super) async fn replace_chat_widget_with_app_server_thread_with_frame_requester(
+        &mut self,
+        app_server: &mut AppServerSession,
+        started: AppServerStartedThread,
+        initial_user_message: Option<crate::chatwidget::UserMessage>,
+        frame_requester: tui::FrameRequester,
+    ) -> Result<()> {
         // Initial messages are for freshly attached primary threads only. Thread switches and
         // resume/fork flows pass `None` so they cannot replay old history and then auto-submit a new
         // user turn by accident.
         self.reset_thread_event_state();
-        let init = self.chatwidget_init_for_forked_or_resumed_thread(
-            tui,
+        let init = self.chatwidget_init_for_forked_or_resumed_thread_with_frame_requester(
+            frame_requester,
             self.config.clone(),
             initial_user_message,
         );

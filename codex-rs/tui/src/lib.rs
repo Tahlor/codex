@@ -990,9 +990,19 @@ async fn recover_fresh_resume_objective(
         );
     }
 
-    if let Some(objective) =
-        recover_current_goal_objective(app_server, target_session.thread_id).await?
-    {
+    let current_goal =
+        match recover_current_goal_objective(app_server, target_session.thread_id).await {
+            Ok(objective) => objective,
+            Err(err) => {
+                tracing::warn!(
+                    thread_id = %target_session.thread_id,
+                    error = %err,
+                    "failed to recover current goal; falling back to rollout history"
+                );
+                None
+            }
+        };
+    if let Some(objective) = current_goal {
         return Ok(objective);
     }
     if let Some(objective) = recover_historical_goal_objective(

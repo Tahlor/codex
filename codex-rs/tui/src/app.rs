@@ -601,9 +601,22 @@ impl App {
         cfg: crate::legacy_core::config::Config,
         initial_user_message: Option<crate::chatwidget::UserMessage>,
     ) -> crate::chatwidget::ChatWidgetInit {
+        self.chatwidget_init_for_forked_or_resumed_thread_with_frame_requester(
+            tui.frame_requester(),
+            cfg,
+            initial_user_message,
+        )
+    }
+
+    pub(super) fn chatwidget_init_for_forked_or_resumed_thread_with_frame_requester(
+        &self,
+        frame_requester: crate::tui::FrameRequester,
+        cfg: crate::legacy_core::config::Config,
+        initial_user_message: Option<crate::chatwidget::UserMessage>,
+    ) -> crate::chatwidget::ChatWidgetInit {
         crate::chatwidget::ChatWidgetInit {
             config: cfg,
-            frame_requester: tui.frame_requester(),
+            frame_requester,
             app_event_tx: self.app_event_tx.clone(),
             workspace_command_runner: self.workspace_command_runner.clone(),
             initial_user_message,
